@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"reflect"
+	"slices"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -16,14 +19,14 @@ import (
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/gen/go/v1/v1connect"
 	"github.com/garethgeorge/backrest/internal/config"
+	"github.com/garethgeorge/backrest/internal/env"
+	"github.com/garethgeorge/backrest/internal/logstore"
 	"github.com/garethgeorge/backrest/internal/oplog"
-	"github.com/garethgeorge/backrest/internal/oplog/indexutil"
 	"github.com/garethgeorge/backrest/internal/orchestrator"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
 	"github.com/garethgeorge/backrest/internal/orchestrator/tasks"
 	"github.com/garethgeorge/backrest/internal/protoutil"
 	"github.com/garethgeorge/backrest/internal/resticinstaller"
-	"github.com/garethgeorge/backrest/internal/rotatinglog"
 	"github.com/garethgeorge/backrest/pkg/restic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -35,12 +38,12 @@ type BackrestHandler struct {
 	config       config.ConfigStore
 	orchestrator *orchestrator.Orchestrator
 	oplog        *oplog.OpLog
-	logStore     *rotatinglog.RotatingLog
+	logStore     *logstore.LogStore
 }
 
 var _ v1connect.BackrestHandler = &BackrestHandler{}
 
-func NewBackrestHandler(config config.ConfigStore, orchestrator *orchestrator.Orchestrator, oplog *oplog.OpLog, logStore *rotatinglog.RotatingLog) *BackrestHandler {
+func NewBackrestHandler(config config.ConfigStore, orchestrator *orchestrator.Orchestrator, oplog *oplog.OpLog, logStore *logstore.LogStore) *BackrestHandler {
 	s := &BackrestHandler{
 		config:       config,
 		orchestrator: orchestrator,
@@ -99,8 +102,15 @@ func (s *BackrestHandler) AddRepo(ctx context.Context, req *connect.Request[v1.R
 		return nil, fmt.Errorf("failed to get config: %w", err)
 	}
 
+	// Deep copy the configuration
 	c = proto.Clone(c).(*v1.Config)
-	c.Repos = append(c.Repos, req.Msg)
+
+	// Add or implicit update the repo
+	if idx := slices.IndexFunc(c.Repos, func(r *v1.Repo) bool { return r.Id == req.Msg.Id }); idx != -1 {
+		c.Repos[idx] = req.Msg
+	} else {
+		c.Repos = append(c.Repos, req.Msg)
+	}
 
 	if err := config.ValidateConfig(c); err != nil {
 		return nil, fmt.Errorf("validation error: %w", err)
@@ -195,26 +205,43 @@ func (s *BackrestHandler) GetOperationEvents(ctx context.Context, req *connect.R
 	errChan := make(chan error, 1)
 	events := make(chan *v1.OperationEvent, 100)
 
-	callback := func(oldOp *v1.Operation, newOp *v1.Operation) {
+	timer := time.NewTicker(60 * time.Second)
+	defer timer.Stop()
+
+	callback := func(ops []*v1.Operation, eventType oplog.OperationEvent) {
 		var event *v1.OperationEvent
-		if oldOp == nil && newOp != nil {
+		switch eventType {
+		case oplog.OPERATION_ADDED:
 			event = &v1.OperationEvent{
-				Type:      v1.OperationEventType_EVENT_CREATED,
-				Operation: newOp,
+				Event: &v1.OperationEvent_CreatedOperations{
+					CreatedOperations: &v1.OperationList{
+						Operations: ops,
+					},
+				},
 			}
-		} else if oldOp != nil && newOp != nil {
+		case oplog.OPERATION_UPDATED:
 			event = &v1.OperationEvent{
-				Type:      v1.OperationEventType_EVENT_UPDATED,
-				Operation: newOp,
+				Event: &v1.OperationEvent_UpdatedOperations{
+					UpdatedOperations: &v1.OperationList{
+						Operations: ops,
+					},
+				},
 			}
-		} else if oldOp != nil && newOp == nil {
+		case oplog.OPERATION_DELETED:
+			ids := make([]int64, len(ops))
+			for i, o := range ops {
+				ids[i] = o.Id
+			}
+
 			event = &v1.OperationEvent{
-				Type:      v1.OperationEventType_EVENT_DELETED,
-				Operation: oldOp,
+				Event: &v1.OperationEvent_DeletedOperations{
+					DeletedOperations: &types.Int64List{
+						Values: ids,
+					},
+				},
 			}
-		} else {
+		default:
 			zap.L().Error("Unknown event type")
-			return
 		}
 
 		select {
@@ -226,11 +253,22 @@ func (s *BackrestHandler) GetOperationEvents(ctx context.Context, req *connect.R
 			}
 		}
 	}
-	s.oplog.Subscribe(&callback)
-	defer s.oplog.Unsubscribe(&callback)
+
+	s.oplog.Subscribe(oplog.SelectAll, &callback)
+	defer func() {
+		if err := s.oplog.Unsubscribe(&callback); err != nil {
+			zap.L().Error("failed to unsubscribe from oplog", zap.Error(err))
+		}
+	}()
 
 	for {
 		select {
+		case <-timer.C:
+			if err := resp.Send(&v1.OperationEvent{
+				Event: &v1.OperationEvent_KeepAlive{},
+			}); err != nil {
+				return err
+			}
 		case err := <-errChan:
 			return err
 		case <-ctx.Done():
@@ -244,12 +282,11 @@ func (s *BackrestHandler) GetOperationEvents(ctx context.Context, req *connect.R
 }
 
 func (s *BackrestHandler) GetOperations(ctx context.Context, req *connect.Request[v1.GetOperationsRequest]) (*connect.Response[v1.OperationList], error) {
-	idCollector := indexutil.CollectAll()
-
-	if req.Msg.LastN != 0 {
-		idCollector = indexutil.CollectLastN(int(req.Msg.LastN))
-	}
 	q, err := opSelectorToQuery(req.Msg.Selector)
+	if req.Msg.LastN != 0 {
+		q.Reversed = true
+		q.Limit = int(req.Msg.LastN)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -259,14 +296,17 @@ func (s *BackrestHandler) GetOperations(ctx context.Context, req *connect.Reques
 		ops = append(ops, op)
 		return nil
 	}
-	if !reflect.DeepEqual(q, oplog.Query{}) {
-		err = s.oplog.ForEach(q, idCollector, opCollector)
-	} else {
-		err = s.oplog.ForAll(opCollector)
-	}
+	err = s.oplog.Query(q, opCollector)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get operations: %w", err)
 	}
+
+	slices.SortFunc(ops, func(i, j *v1.Operation) int {
+		if i.Id < j.Id {
+			return -1
+		}
+		return 1
+	})
 
 	return connect.NewResponse(&v1.OperationList{
 		Operations: ops,
@@ -390,69 +430,28 @@ func (s *BackrestHandler) Restore(ctx context.Context, req *connect.Request[v1.R
 	return connect.NewResponse(&emptypb.Empty{}), nil
 }
 
-func (s *BackrestHandler) RunCommand(ctx context.Context, req *connect.Request[v1.RunCommandRequest], resp *connect.ServerStream[types.BytesValue]) error {
-	repo, err := s.orchestrator.GetRepoOrchestrator(req.Msg.RepoId)
-	if err != nil {
-		return fmt.Errorf("failed to get repo %q: %w", req.Msg.RepoId, err)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-
-	outputs := make(chan []byte, 100)
-	errChan := make(chan error, 1)
-	go func() {
-		start := time.Now()
-		if err := repo.RunCommand(ctx, req.Msg.Command, func(output []byte) {
-			outputs <- bytes.Clone(output)
-		}); err != nil {
-			errChan <- err
-		}
-		outputs <- []byte("took " + time.Since(start).String())
-		cancel()
-	}()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	bufSize := 32 * 1024
-	buf := make([]byte, 0, bufSize)
-
-	flush := func() error {
-		if len(buf) > 0 {
-			if err := resp.Send(&types.BytesValue{Value: buf}); err != nil {
-				return fmt.Errorf("failed to write output: %w", err)
-			}
-			buf = buf[:0]
+func (s *BackrestHandler) RunCommand(ctx context.Context, req *connect.Request[v1.RunCommandRequest]) (*connect.Response[types.Int64Value], error) {
+	// group commands within the last 24 hours (or 256 operations) into the same flow ID
+	var flowID int64
+	if s.oplog.Query(oplog.Query{RepoID: req.Msg.RepoId, Limit: 256, Reversed: true}, func(op *v1.Operation) error {
+		if op.GetOperationRunCommand() != nil && time.Since(time.UnixMilli(op.UnixTimeStartMs)) < 30*time.Minute {
+			flowID = op.FlowId
 		}
 		return nil
+	}) != nil {
+		return nil, fmt.Errorf("failed to query operations")
 	}
 
-	for {
-		select {
-		case err := <-errChan:
-			if err := flush(); err != nil {
-				return err
-			}
-			return err
-		case <-ctx.Done():
-			return flush()
-		case output := <-outputs:
-			if len(output)+len(buf) > bufSize {
-				flush()
-			}
-			if len(output) > bufSize {
-				if err := resp.Send(&types.BytesValue{Value: output}); err != nil {
-					return fmt.Errorf("failed to write output: %w", err)
-				}
-				continue
-			}
-			buf = append(buf, output...)
-		case <-ticker.C:
-			if len(buf) > 0 {
-				flush()
-			}
-		}
+	task := tasks.NewOneoffRunCommandTask(req.Msg.RepoId, tasks.PlanForSystemTasks, flowID, time.Now(), req.Msg.Command)
+	st, err := s.orchestrator.CreateUnscheduledTask(task, tasks.TaskPriorityInteractive, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
+	if err := s.orchestrator.RunTask(context.Background(), st); err != nil {
+		return nil, fmt.Errorf("failed to run command: %w", err)
+	}
+
+	return connect.NewResponse(&types.Int64Value{Value: st.Op.GetId()}), nil
 }
 
 func (s *BackrestHandler) Cancel(ctx context.Context, req *connect.Request[types.Int64Value]) (*connect.Response[emptypb.Empty], error) {
@@ -478,12 +477,7 @@ func (s *BackrestHandler) ClearHistory(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, err
 	}
-	if !reflect.DeepEqual(q, oplog.Query{}) {
-		err = s.oplog.ForEach(q, indexutil.CollectAll(), opCollector)
-	} else {
-		err = s.oplog.ForAll(opCollector)
-	}
-	if err != nil {
+	if err := s.oplog.Query(q, opCollector); err != nil {
 		return nil, fmt.Errorf("failed to get operations to delete: %w", err)
 	}
 
@@ -494,18 +488,73 @@ func (s *BackrestHandler) ClearHistory(ctx context.Context, req *connect.Request
 	return connect.NewResponse(&emptypb.Empty{}), err
 }
 
-func (s *BackrestHandler) GetLogs(ctx context.Context, req *connect.Request[v1.LogDataRequest]) (*connect.Response[types.BytesValue], error) {
-	data, err := s.logStore.Read(req.Msg.GetRef())
+func (s *BackrestHandler) GetLogs(ctx context.Context, req *connect.Request[v1.LogDataRequest], resp *connect.ServerStream[types.BytesValue]) error {
+	r, err := s.logStore.Open(req.Msg.Ref)
 	if err != nil {
-		if errors.Is(err, rotatinglog.ErrFileNotFound) {
-			return connect.NewResponse(&types.BytesValue{
-				Value: []byte(fmt.Sprintf("file associated with log %v not found, it may have rotated out of the log history", req.Msg.GetRef())),
-			}), nil
+		if errors.Is(err, logstore.ErrLogNotFound) {
+			resp.Send(&types.BytesValue{
+				Value: []byte(fmt.Sprintf("file associated with log %v not found, it may have expired.", req.Msg.GetRef())),
+			})
+			return nil
 		}
-
-		return nil, fmt.Errorf("get log data %v: %w", req.Msg.GetRef(), err)
+		return fmt.Errorf("get log data %v: %w", req.Msg.GetRef(), err)
 	}
-	return connect.NewResponse(&types.BytesValue{Value: data}), nil
+	go func() {
+		<-ctx.Done()
+		r.Close()
+	}()
+
+	var bufferMu sync.Mutex
+	var buffer bytes.Buffer
+	var errChan = make(chan error, 1)
+	go func() {
+		data := make([]byte, 4*1024)
+		for {
+			n, err := r.Read(data)
+			if n == 0 {
+				close(errChan)
+				break
+			} else if err != nil && err != io.EOF {
+				errChan <- fmt.Errorf("failed to read log data: %w", err)
+				close(errChan)
+				return
+			}
+			bufferMu.Lock()
+			buffer.Write(data[:n])
+			bufferMu.Unlock()
+		}
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	flush := func() error {
+		bufferMu.Lock()
+		if buffer.Len() > 0 {
+			if err := resp.Send(&types.BytesValue{Value: buffer.Bytes()}); err != nil {
+				bufferMu.Unlock()
+				return fmt.Errorf("failed to send log data: %w", err)
+			}
+			buffer.Reset()
+		}
+		bufferMu.Unlock()
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return flush()
+		case err := <-errChan:
+			_ = flush()
+			return err
+		case <-ticker.C:
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+
 }
 
 func (s *BackrestHandler) GetDownloadURL(ctx context.Context, req *connect.Request[types.Int64Value]) (*connect.Response[types.StringValue], error) {
@@ -542,19 +591,122 @@ func (s *BackrestHandler) PathAutocomplete(ctx context.Context, path *connect.Re
 	return connect.NewResponse(&types.StringList{Values: paths}), nil
 }
 
+func (s *BackrestHandler) GetSummaryDashboard(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[v1.SummaryDashboardResponse], error) {
+	config, err := s.config.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get config: %w", err)
+	}
+
+	generateSummaryHelper := func(id string, q oplog.Query) (*v1.SummaryDashboardResponse_Summary, error) {
+		var backupsExamined int64
+		var bytesScanned30 int64
+		var bytesAdded30 int64
+		var backupsFailed30 int64
+		var backupsSuccess30 int64
+		var backupsWarning30 int64
+		var nextBackupTime int64
+		backupChart := &v1.SummaryDashboardResponse_BackupChart{}
+
+		s.oplog.Query(q, func(op *v1.Operation) error {
+			t := time.UnixMilli(op.UnixTimeStartMs)
+
+			if backupOp := op.GetOperationBackup(); backupOp != nil {
+				if time.Since(t) > 30*24*time.Hour {
+					return oplog.ErrStopIteration
+				} else if op.GetStatus() == v1.OperationStatus_STATUS_PENDING {
+					nextBackupTime = op.UnixTimeStartMs
+					return nil
+				}
+				backupsExamined++
+
+				if op.Status == v1.OperationStatus_STATUS_SUCCESS {
+					backupsSuccess30++
+				} else if op.Status == v1.OperationStatus_STATUS_ERROR {
+					backupsFailed30++
+				} else if op.Status == v1.OperationStatus_STATUS_WARNING {
+					backupsWarning30++
+				}
+
+				if summary := backupOp.GetLastStatus().GetSummary(); summary != nil {
+					bytesScanned30 += summary.TotalBytesProcessed
+					bytesAdded30 += summary.DataAdded
+				}
+
+				// recent backups chart
+				if len(backupChart.TimestampMs) < 60 { // only include the latest 90 backups in the chart
+					duration := op.UnixTimeEndMs - op.UnixTimeStartMs
+					if duration <= 1000 {
+						duration = 1000
+					}
+
+					backupChart.FlowId = append(backupChart.FlowId, op.FlowId)
+					backupChart.TimestampMs = append(backupChart.TimestampMs, op.UnixTimeStartMs)
+					backupChart.DurationMs = append(backupChart.DurationMs, duration)
+					backupChart.Status = append(backupChart.Status, op.Status)
+					backupChart.BytesAdded = append(backupChart.BytesAdded, backupOp.GetLastStatus().GetSummary().GetDataAdded())
+				}
+			}
+
+			return nil
+		})
+
+		if backupsExamined == 0 {
+			backupsExamined = 1 // prevent division by zero for avg calculations
+		}
+
+		return &v1.SummaryDashboardResponse_Summary{
+			Id:                        id,
+			BytesScannedLast_30Days:   bytesScanned30,
+			BytesAddedLast_30Days:     bytesAdded30,
+			BackupsFailed_30Days:      backupsFailed30,
+			BackupsWarningLast_30Days: backupsWarning30,
+			BackupsSuccessLast_30Days: backupsSuccess30,
+			BytesScannedAvg:           bytesScanned30 / backupsExamined,
+			BytesAddedAvg:             bytesAdded30 / backupsExamined,
+			NextBackupTimeMs:          nextBackupTime,
+			RecentBackups:             backupChart,
+		}, nil
+	}
+
+	response := &v1.SummaryDashboardResponse{
+		ConfigPath: env.ConfigFilePath(),
+		DataPath:   env.DataDir(),
+	}
+
+	for _, repo := range config.Repos {
+		resp, err := generateSummaryHelper(repo.Id, oplog.Query{RepoID: repo.Id, Reversed: true, Limit: 1000})
+		if err != nil {
+			return nil, fmt.Errorf("summary for repo %q: %w", repo.Id, err)
+		}
+
+		response.RepoSummaries = append(response.RepoSummaries, resp)
+	}
+
+	for _, plan := range config.Plans {
+		resp, err := generateSummaryHelper(plan.Id, oplog.Query{PlanID: plan.Id, Reversed: true, Limit: 1000})
+		if err != nil {
+			return nil, fmt.Errorf("summary for plan %q: %w", plan.Id, err)
+		}
+
+		response.PlanSummaries = append(response.PlanSummaries, resp)
+	}
+
+	return connect.NewResponse(response), nil
+}
+
 func opSelectorToQuery(sel *v1.OpSelector) (oplog.Query, error) {
 	if sel == nil {
 		return oplog.Query{}, errors.New("empty selector")
 	}
 	q := oplog.Query{
-		RepoId:     sel.RepoId,
-		PlanId:     sel.PlanId,
-		SnapshotId: sel.SnapshotId,
-		FlowId:     sel.FlowId,
+		RepoID:     sel.RepoId,
+		PlanID:     sel.PlanId,
+		SnapshotID: sel.SnapshotId,
+		FlowID:     sel.FlowId,
 	}
 	if len(sel.Ids) > 0 && !reflect.DeepEqual(q, oplog.Query{}) {
 		return oplog.Query{}, errors.New("cannot specify both query and ids")
 	}
-	q.Ids = sel.Ids
+	q.OpIDs = sel.Ids
 	return q, nil
 }

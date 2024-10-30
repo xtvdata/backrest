@@ -13,8 +13,8 @@ import {
   OpSelector,
 } from "../../gen/ts/v1/service_pb";
 import { SpinButton } from "../components/SpinButton";
-import { shouldHideStatus } from "../state/oplog";
 import { useShowModal } from "../components/ModalManager";
+import { useConfig } from "../components/ConfigProvider";
 
 export const PlanView = ({ plan }: React.PropsWithChildren<{ plan: Plan }>) => {
   const alertsApi = useAlertApi()!;
@@ -48,7 +48,10 @@ export const PlanView = ({ plan }: React.PropsWithChildren<{ plan: Plan }>) => {
     try {
       alertsApi.info("Clearing error history...");
       await backrestService.clearHistory({
-        selector: new OpSelector({ planId: plan.id, repoId: plan.repo }),
+        selector: new OpSelector({
+          planId: plan.id,
+          repoId: plan.repo,
+        }),
         onlyFailed: true,
       });
       alertsApi.success("Error history cleared.");
@@ -114,7 +117,7 @@ export const PlanView = ({ plan }: React.PropsWithChildren<{ plan: Plan }>) => {
           },
           {
             key: "2",
-            label: "Operation List",
+            label: "Full Operation History",
             children: (
               <>
                 <h2>Backup Action History</h2>

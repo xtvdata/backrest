@@ -9,34 +9,39 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
+	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/gen/go/v1/v1connect"
 	"github.com/garethgeorge/backrest/internal/api"
 	"github.com/garethgeorge/backrest/internal/auth"
 	"github.com/garethgeorge/backrest/internal/config"
 	"github.com/garethgeorge/backrest/internal/env"
+	"github.com/garethgeorge/backrest/internal/logstore"
+	"github.com/garethgeorge/backrest/internal/metric"
 	"github.com/garethgeorge/backrest/internal/oplog"
+	"github.com/garethgeorge/backrest/internal/oplog/bboltstore"
+	"github.com/garethgeorge/backrest/internal/oplog/sqlitestore"
 	"github.com/garethgeorge/backrest/internal/orchestrator"
 	"github.com/garethgeorge/backrest/internal/resticinstaller"
-	"github.com/garethgeorge/backrest/internal/rotatinglog"
 	"github.com/garethgeorge/backrest/webui"
 	"github.com/mattn/go-colorable"
-	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var InstallDepsOnly = flag.Bool("install-deps-only", false, "install dependencies and exit")
 
 func main() {
 	flag.Parse()
+	installLoggers()
 
 	resticPath, err := resticinstaller.FindOrInstallResticBinary()
 	if err != nil {
@@ -59,31 +64,51 @@ func main() {
 		zap.S().Fatalf("error loading config: %v", err)
 	}
 
-	// Create the authenticator
-	authenticator := auth.NewAuthenticator(getSecret(), configStore)
-
 	var wg sync.WaitGroup
 
 	// Create / load the operation log
-	oplogFile := path.Join(env.DataDir(), "oplog.boltdb")
-	oplog, err := oplog.NewOpLog(oplogFile)
-	if err != nil {
-		if !errors.Is(err, bbolt.ErrTimeout) {
-			zap.S().Fatalf("timeout while waiting to open database, is the database open elsewhere?")
-		}
+	oplogFile := path.Join(env.DataDir(), "oplog.sqlite")
+	opstore, err := sqlitestore.NewSqliteStore(oplogFile)
+	if errors.Is(err, sqlitestore.ErrLocked) {
+		zap.S().Fatalf("oplog is locked by another instance of backrest that is using the same data directory %q, kill that instance before starting another one.", env.DataDir())
+	} else if err != nil {
 		zap.S().Warnf("operation log may be corrupted, if errors recur delete the file %q and restart. Your backups stored in your repos are safe.", oplogFile)
-		zap.S().Fatalf("error creating oplog : %v", err)
+		zap.S().Fatalf("error creating oplog: %v", err)
 	}
-	defer oplog.Close()
+	defer opstore.Close()
+
+	log, err := oplog.NewOpLog(opstore)
+	if err != nil {
+		zap.S().Fatalf("error creating oplog: %v", err)
+	}
+	migrateBboltOplog(opstore)
 
 	// Create rotating log storage
-	logStore := rotatinglog.NewRotatingLog(path.Join(env.DataDir(), "rotatinglogs"), 14) // 14 days of logs
+	logStore, err := logstore.NewLogStore(filepath.Join(env.DataDir(), "tasklogs"))
 	if err != nil {
-		zap.S().Fatalf("error creating rotating log storage: %v", err)
+		zap.S().Fatalf("error creating task log store: %v", err)
 	}
+	logstore.MigrateTarLogsInDir(logStore, filepath.Join(env.DataDir(), "rotatinglogs"))
+	deleteLogsForOp := func(ops []*v1.Operation, event oplog.OperationEvent) {
+		if event != oplog.OPERATION_DELETED {
+			return
+		}
+		for _, op := range ops {
+			if err := logStore.DeleteWithParent(op.Id); err != nil {
+				zap.S().Warnf("error deleting logs for operation %q: %v", op.Id, err)
+			}
+		}
+	}
+	log.Subscribe(oplog.Query{}, &deleteLogsForOp)
+	defer func() {
+		if err := logStore.Close(); err != nil {
+			zap.S().Warnf("error closing log store: %v", err)
+		}
+		log.Unsubscribe(&deleteLogsForOp)
+	}()
 
 	// Create orchestrator and start task loop.
-	orchestrator, err := orchestrator.NewOrchestrator(resticPath, cfg, oplog, logStore)
+	orchestrator, err := orchestrator.NewOrchestrator(resticPath, cfg, log, logStore)
 	if err != nil {
 		zap.S().Fatalf("error creating orchestrator: %v", err)
 	}
@@ -98,10 +123,11 @@ func main() {
 	apiBackrestHandler := api.NewBackrestHandler(
 		configStore,
 		orchestrator,
-		oplog,
+		log,
 		logStore,
 	)
 
+	authenticator := auth.NewAuthenticator(getSecret(), configStore)
 	apiAuthenticationHandler := api.NewAuthenticationHandler(authenticator)
 
 	mux := http.NewServeMux()
@@ -109,7 +135,8 @@ func main() {
 	backrestHandlerPath, backrestHandler := v1connect.NewBackrestHandler(apiBackrestHandler)
 	mux.Handle(backrestHandlerPath, auth.RequireAuthentication(backrestHandler, authenticator))
 	mux.Handle("/", webui.Handler())
-	mux.Handle("/download/", http.StripPrefix("/download", api.NewDownloadHandler(oplog)))
+	mux.Handle("/download/", http.StripPrefix("/download", api.NewDownloadHandler(log)))
+	mux.Handle("/metrics", auth.RequireAuthentication(metric.GetRegistry().Handler(), authenticator))
 
 	// Serve the HTTP gateway
 	server := &http.Server{
@@ -128,26 +155,6 @@ func main() {
 	zap.L().Info("HTTP gateway shutdown")
 
 	wg.Wait()
-}
-
-func init() {
-	if !strings.HasPrefix(os.Getenv("ENV"), "prod") {
-		c := zap.NewDevelopmentEncoderConfig()
-		c.EncodeLevel = zapcore.CapitalColorLevelEncoder
-		c.EncodeTime = zapcore.ISO8601TimeEncoder
-		l := zap.New(zapcore.NewCore(
-			zapcore.NewConsoleEncoder(c),
-			zapcore.AddSync(colorable.NewColorableStdout()),
-			zapcore.DebugLevel,
-		))
-		zap.ReplaceGlobals(l)
-	} else {
-		zap.ReplaceGlobals(zap.New(zapcore.NewCore(
-			zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
-			zapcore.AddSync(os.Stdout),
-			zapcore.DebugLevel,
-		)))
-	}
 }
 
 func createConfigProvider() config.ConfigStore {
@@ -199,4 +206,87 @@ func newForceKillHandler() func() {
 		times.Add(1)
 		zap.S().Warn("attempting graceful shutdown, to force termination press Ctrl+C again")
 	}
+}
+
+func installLoggers() {
+	// Pretty logging for console
+	c := zap.NewDevelopmentEncoderConfig()
+	c.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	c.EncodeTime = zapcore.ISO8601TimeEncoder
+	pretty := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(c),
+		zapcore.AddSync(colorable.NewColorableStdout()),
+		zapcore.InfoLevel,
+	)
+
+	// JSON logging to log directory
+	logsDir := env.LogsPath()
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		zap.ReplaceGlobals(zap.New(pretty))
+		zap.S().Errorf("error creating logs directory %q, will only log to console for now: %v", err)
+		return
+	}
+
+	writer := &lumberjack.Logger{
+		Filename:   filepath.Join(logsDir, "backrest.log"),
+		MaxSize:    5, // megabytes
+		MaxBackups: 3,
+		MaxAge:     14,
+		Compress:   true,
+	}
+
+	ugly := zapcore.NewCore(
+		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(writer),
+		zapcore.DebugLevel,
+	)
+
+	zap.ReplaceGlobals(zap.New(zapcore.NewTee(pretty, ugly)))
+	zap.S().Infof("writing logs to: %v", logsDir)
+}
+
+// migrateBboltOplog migrates the old bbolt oplog to the new sqlite oplog.
+// It is careful to ensure that all migrations are applied before copying
+// operations directly to the sqlite logstore.
+func migrateBboltOplog(logstore oplog.OpStore) {
+	oldBboltOplogFile := path.Join(env.DataDir(), "oplog.boltdb")
+	if _, err := os.Stat(oldBboltOplogFile); err != nil {
+		return
+	}
+
+	zap.S().Warnf("found old bbolt oplog file %q, migrating to sqlite", oldBboltOplogFile)
+	oldOpstore, err := bboltstore.NewBboltStore(oldBboltOplogFile)
+	if err != nil {
+		zap.S().Fatalf("error opening old bolt opstore: %v", oldBboltOplogFile, err)
+	}
+	oldOplog, err := oplog.NewOpLog(oldOpstore)
+	if err != nil {
+		zap.S().Fatalf("error opening old bolt oplog: %v", oldBboltOplogFile, err)
+	}
+
+	var errs []error
+	var count int
+	if err := oldOplog.Query(oplog.Query{}, func(op *v1.Operation) error {
+		if err := logstore.Add(op); err != nil {
+			errs = append(errs, err)
+			zap.L().Warn("failed to migrate operation", zap.Error(err), zap.Any("operation", op))
+		} else {
+			count++
+		}
+		return nil
+	}); err != nil {
+		zap.S().Warnf("couldn't migrate all operations from the old bbolt oplog, if this recurs delete the file %q and restart", oldBboltOplogFile)
+		zap.S().Fatalf("error migrating old bbolt oplog: %v", err)
+	}
+
+	if len(errs) > 0 {
+		zap.S().Errorf("encountered %d errors migrating old bbolt oplog, see logs for details.", len(errs), oldBboltOplogFile)
+	}
+	if err := oldOpstore.Close(); err != nil {
+		zap.S().Warnf("error closing old bbolt oplog: %v", err)
+	}
+	if err := os.Rename(oldBboltOplogFile, oldBboltOplogFile+".deprecated"); err != nil {
+		zap.S().Warnf("error removing old bbolt oplog: %v", err)
+	}
+	zap.S().Infof("migrated %d operations from old bbolt oplog to sqlite", count)
 }

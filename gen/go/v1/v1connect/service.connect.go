@@ -72,28 +72,32 @@ const (
 	// BackrestPathAutocompleteProcedure is the fully-qualified name of the Backrest's PathAutocomplete
 	// RPC.
 	BackrestPathAutocompleteProcedure = "/v1.Backrest/PathAutocomplete"
+	// BackrestGetSummaryDashboardProcedure is the fully-qualified name of the Backrest's
+	// GetSummaryDashboard RPC.
+	BackrestGetSummaryDashboardProcedure = "/v1.Backrest/GetSummaryDashboard"
 )
 
 // These variables are the protoreflect.Descriptor objects for the RPCs defined in this package.
 var (
-	backrestServiceDescriptor                  = v1.File_v1_service_proto.Services().ByName("Backrest")
-	backrestGetConfigMethodDescriptor          = backrestServiceDescriptor.Methods().ByName("GetConfig")
-	backrestSetConfigMethodDescriptor          = backrestServiceDescriptor.Methods().ByName("SetConfig")
-	backrestAddRepoMethodDescriptor            = backrestServiceDescriptor.Methods().ByName("AddRepo")
-	backrestGetOperationEventsMethodDescriptor = backrestServiceDescriptor.Methods().ByName("GetOperationEvents")
-	backrestGetOperationsMethodDescriptor      = backrestServiceDescriptor.Methods().ByName("GetOperations")
-	backrestListSnapshotsMethodDescriptor      = backrestServiceDescriptor.Methods().ByName("ListSnapshots")
-	backrestListSnapshotFilesMethodDescriptor  = backrestServiceDescriptor.Methods().ByName("ListSnapshotFiles")
-	backrestBackupMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("Backup")
-	backrestDoRepoTaskMethodDescriptor         = backrestServiceDescriptor.Methods().ByName("DoRepoTask")
-	backrestForgetMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("Forget")
-	backrestRestoreMethodDescriptor            = backrestServiceDescriptor.Methods().ByName("Restore")
-	backrestCancelMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("Cancel")
-	backrestGetLogsMethodDescriptor            = backrestServiceDescriptor.Methods().ByName("GetLogs")
-	backrestRunCommandMethodDescriptor         = backrestServiceDescriptor.Methods().ByName("RunCommand")
-	backrestGetDownloadURLMethodDescriptor     = backrestServiceDescriptor.Methods().ByName("GetDownloadURL")
-	backrestClearHistoryMethodDescriptor       = backrestServiceDescriptor.Methods().ByName("ClearHistory")
-	backrestPathAutocompleteMethodDescriptor   = backrestServiceDescriptor.Methods().ByName("PathAutocomplete")
+	backrestServiceDescriptor                   = v1.File_v1_service_proto.Services().ByName("Backrest")
+	backrestGetConfigMethodDescriptor           = backrestServiceDescriptor.Methods().ByName("GetConfig")
+	backrestSetConfigMethodDescriptor           = backrestServiceDescriptor.Methods().ByName("SetConfig")
+	backrestAddRepoMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("AddRepo")
+	backrestGetOperationEventsMethodDescriptor  = backrestServiceDescriptor.Methods().ByName("GetOperationEvents")
+	backrestGetOperationsMethodDescriptor       = backrestServiceDescriptor.Methods().ByName("GetOperations")
+	backrestListSnapshotsMethodDescriptor       = backrestServiceDescriptor.Methods().ByName("ListSnapshots")
+	backrestListSnapshotFilesMethodDescriptor   = backrestServiceDescriptor.Methods().ByName("ListSnapshotFiles")
+	backrestBackupMethodDescriptor              = backrestServiceDescriptor.Methods().ByName("Backup")
+	backrestDoRepoTaskMethodDescriptor          = backrestServiceDescriptor.Methods().ByName("DoRepoTask")
+	backrestForgetMethodDescriptor              = backrestServiceDescriptor.Methods().ByName("Forget")
+	backrestRestoreMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("Restore")
+	backrestCancelMethodDescriptor              = backrestServiceDescriptor.Methods().ByName("Cancel")
+	backrestGetLogsMethodDescriptor             = backrestServiceDescriptor.Methods().ByName("GetLogs")
+	backrestRunCommandMethodDescriptor          = backrestServiceDescriptor.Methods().ByName("RunCommand")
+	backrestGetDownloadURLMethodDescriptor      = backrestServiceDescriptor.Methods().ByName("GetDownloadURL")
+	backrestClearHistoryMethodDescriptor        = backrestServiceDescriptor.Methods().ByName("ClearHistory")
+	backrestPathAutocompleteMethodDescriptor    = backrestServiceDescriptor.Methods().ByName("PathAutocomplete")
+	backrestGetSummaryDashboardMethodDescriptor = backrestServiceDescriptor.Methods().ByName("GetSummaryDashboard")
 )
 
 // BackrestClient is a client for the v1.Backrest service.
@@ -116,15 +120,17 @@ type BackrestClient interface {
 	// Cancel attempts to cancel a task with the given operation ID. Not guaranteed to succeed.
 	Cancel(context.Context, *connect.Request[types.Int64Value]) (*connect.Response[emptypb.Empty], error)
 	// GetLogs returns the keyed large data for the given operation.
-	GetLogs(context.Context, *connect.Request[v1.LogDataRequest]) (*connect.Response[types.BytesValue], error)
+	GetLogs(context.Context, *connect.Request[v1.LogDataRequest]) (*connect.ServerStreamForClient[types.BytesValue], error)
 	// RunCommand executes a generic restic command on the repository.
-	RunCommand(context.Context, *connect.Request[v1.RunCommandRequest]) (*connect.ServerStreamForClient[types.BytesValue], error)
+	RunCommand(context.Context, *connect.Request[v1.RunCommandRequest]) (*connect.Response[types.Int64Value], error)
 	// GetDownloadURL returns a signed download URL given a forget operation ID.
 	GetDownloadURL(context.Context, *connect.Request[types.Int64Value]) (*connect.Response[types.StringValue], error)
 	// Clears the history of operations
 	ClearHistory(context.Context, *connect.Request[v1.ClearHistoryRequest]) (*connect.Response[emptypb.Empty], error)
 	// PathAutocomplete provides path autocompletion options for a given filesystem path.
 	PathAutocomplete(context.Context, *connect.Request[types.StringValue]) (*connect.Response[types.StringList], error)
+	// GetSummaryDashboard returns data for the dashboard view.
+	GetSummaryDashboard(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[v1.SummaryDashboardResponse], error)
 }
 
 // NewBackrestClient constructs a client for the v1.Backrest service. By default, it uses the
@@ -215,7 +221,7 @@ func NewBackrestClient(httpClient connect.HTTPClient, baseURL string, opts ...co
 			connect.WithSchema(backrestGetLogsMethodDescriptor),
 			connect.WithClientOptions(opts...),
 		),
-		runCommand: connect.NewClient[v1.RunCommandRequest, types.BytesValue](
+		runCommand: connect.NewClient[v1.RunCommandRequest, types.Int64Value](
 			httpClient,
 			baseURL+BackrestRunCommandProcedure,
 			connect.WithSchema(backrestRunCommandMethodDescriptor),
@@ -239,28 +245,35 @@ func NewBackrestClient(httpClient connect.HTTPClient, baseURL string, opts ...co
 			connect.WithSchema(backrestPathAutocompleteMethodDescriptor),
 			connect.WithClientOptions(opts...),
 		),
+		getSummaryDashboard: connect.NewClient[emptypb.Empty, v1.SummaryDashboardResponse](
+			httpClient,
+			baseURL+BackrestGetSummaryDashboardProcedure,
+			connect.WithSchema(backrestGetSummaryDashboardMethodDescriptor),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // backrestClient implements BackrestClient.
 type backrestClient struct {
-	getConfig          *connect.Client[emptypb.Empty, v1.Config]
-	setConfig          *connect.Client[v1.Config, v1.Config]
-	addRepo            *connect.Client[v1.Repo, v1.Config]
-	getOperationEvents *connect.Client[emptypb.Empty, v1.OperationEvent]
-	getOperations      *connect.Client[v1.GetOperationsRequest, v1.OperationList]
-	listSnapshots      *connect.Client[v1.ListSnapshotsRequest, v1.ResticSnapshotList]
-	listSnapshotFiles  *connect.Client[v1.ListSnapshotFilesRequest, v1.ListSnapshotFilesResponse]
-	backup             *connect.Client[types.StringValue, emptypb.Empty]
-	doRepoTask         *connect.Client[v1.DoRepoTaskRequest, emptypb.Empty]
-	forget             *connect.Client[v1.ForgetRequest, emptypb.Empty]
-	restore            *connect.Client[v1.RestoreSnapshotRequest, emptypb.Empty]
-	cancel             *connect.Client[types.Int64Value, emptypb.Empty]
-	getLogs            *connect.Client[v1.LogDataRequest, types.BytesValue]
-	runCommand         *connect.Client[v1.RunCommandRequest, types.BytesValue]
-	getDownloadURL     *connect.Client[types.Int64Value, types.StringValue]
-	clearHistory       *connect.Client[v1.ClearHistoryRequest, emptypb.Empty]
-	pathAutocomplete   *connect.Client[types.StringValue, types.StringList]
+	getConfig           *connect.Client[emptypb.Empty, v1.Config]
+	setConfig           *connect.Client[v1.Config, v1.Config]
+	addRepo             *connect.Client[v1.Repo, v1.Config]
+	getOperationEvents  *connect.Client[emptypb.Empty, v1.OperationEvent]
+	getOperations       *connect.Client[v1.GetOperationsRequest, v1.OperationList]
+	listSnapshots       *connect.Client[v1.ListSnapshotsRequest, v1.ResticSnapshotList]
+	listSnapshotFiles   *connect.Client[v1.ListSnapshotFilesRequest, v1.ListSnapshotFilesResponse]
+	backup              *connect.Client[types.StringValue, emptypb.Empty]
+	doRepoTask          *connect.Client[v1.DoRepoTaskRequest, emptypb.Empty]
+	forget              *connect.Client[v1.ForgetRequest, emptypb.Empty]
+	restore             *connect.Client[v1.RestoreSnapshotRequest, emptypb.Empty]
+	cancel              *connect.Client[types.Int64Value, emptypb.Empty]
+	getLogs             *connect.Client[v1.LogDataRequest, types.BytesValue]
+	runCommand          *connect.Client[v1.RunCommandRequest, types.Int64Value]
+	getDownloadURL      *connect.Client[types.Int64Value, types.StringValue]
+	clearHistory        *connect.Client[v1.ClearHistoryRequest, emptypb.Empty]
+	pathAutocomplete    *connect.Client[types.StringValue, types.StringList]
+	getSummaryDashboard *connect.Client[emptypb.Empty, v1.SummaryDashboardResponse]
 }
 
 // GetConfig calls v1.Backrest.GetConfig.
@@ -324,13 +337,13 @@ func (c *backrestClient) Cancel(ctx context.Context, req *connect.Request[types.
 }
 
 // GetLogs calls v1.Backrest.GetLogs.
-func (c *backrestClient) GetLogs(ctx context.Context, req *connect.Request[v1.LogDataRequest]) (*connect.Response[types.BytesValue], error) {
-	return c.getLogs.CallUnary(ctx, req)
+func (c *backrestClient) GetLogs(ctx context.Context, req *connect.Request[v1.LogDataRequest]) (*connect.ServerStreamForClient[types.BytesValue], error) {
+	return c.getLogs.CallServerStream(ctx, req)
 }
 
 // RunCommand calls v1.Backrest.RunCommand.
-func (c *backrestClient) RunCommand(ctx context.Context, req *connect.Request[v1.RunCommandRequest]) (*connect.ServerStreamForClient[types.BytesValue], error) {
-	return c.runCommand.CallServerStream(ctx, req)
+func (c *backrestClient) RunCommand(ctx context.Context, req *connect.Request[v1.RunCommandRequest]) (*connect.Response[types.Int64Value], error) {
+	return c.runCommand.CallUnary(ctx, req)
 }
 
 // GetDownloadURL calls v1.Backrest.GetDownloadURL.
@@ -346,6 +359,11 @@ func (c *backrestClient) ClearHistory(ctx context.Context, req *connect.Request[
 // PathAutocomplete calls v1.Backrest.PathAutocomplete.
 func (c *backrestClient) PathAutocomplete(ctx context.Context, req *connect.Request[types.StringValue]) (*connect.Response[types.StringList], error) {
 	return c.pathAutocomplete.CallUnary(ctx, req)
+}
+
+// GetSummaryDashboard calls v1.Backrest.GetSummaryDashboard.
+func (c *backrestClient) GetSummaryDashboard(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[v1.SummaryDashboardResponse], error) {
+	return c.getSummaryDashboard.CallUnary(ctx, req)
 }
 
 // BackrestHandler is an implementation of the v1.Backrest service.
@@ -368,15 +386,17 @@ type BackrestHandler interface {
 	// Cancel attempts to cancel a task with the given operation ID. Not guaranteed to succeed.
 	Cancel(context.Context, *connect.Request[types.Int64Value]) (*connect.Response[emptypb.Empty], error)
 	// GetLogs returns the keyed large data for the given operation.
-	GetLogs(context.Context, *connect.Request[v1.LogDataRequest]) (*connect.Response[types.BytesValue], error)
+	GetLogs(context.Context, *connect.Request[v1.LogDataRequest], *connect.ServerStream[types.BytesValue]) error
 	// RunCommand executes a generic restic command on the repository.
-	RunCommand(context.Context, *connect.Request[v1.RunCommandRequest], *connect.ServerStream[types.BytesValue]) error
+	RunCommand(context.Context, *connect.Request[v1.RunCommandRequest]) (*connect.Response[types.Int64Value], error)
 	// GetDownloadURL returns a signed download URL given a forget operation ID.
 	GetDownloadURL(context.Context, *connect.Request[types.Int64Value]) (*connect.Response[types.StringValue], error)
 	// Clears the history of operations
 	ClearHistory(context.Context, *connect.Request[v1.ClearHistoryRequest]) (*connect.Response[emptypb.Empty], error)
 	// PathAutocomplete provides path autocompletion options for a given filesystem path.
 	PathAutocomplete(context.Context, *connect.Request[types.StringValue]) (*connect.Response[types.StringList], error)
+	// GetSummaryDashboard returns data for the dashboard view.
+	GetSummaryDashboard(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[v1.SummaryDashboardResponse], error)
 }
 
 // NewBackrestHandler builds an HTTP handler from the service implementation. It returns the path on
@@ -457,13 +477,13 @@ func NewBackrestHandler(svc BackrestHandler, opts ...connect.HandlerOption) (str
 		connect.WithSchema(backrestCancelMethodDescriptor),
 		connect.WithHandlerOptions(opts...),
 	)
-	backrestGetLogsHandler := connect.NewUnaryHandler(
+	backrestGetLogsHandler := connect.NewServerStreamHandler(
 		BackrestGetLogsProcedure,
 		svc.GetLogs,
 		connect.WithSchema(backrestGetLogsMethodDescriptor),
 		connect.WithHandlerOptions(opts...),
 	)
-	backrestRunCommandHandler := connect.NewServerStreamHandler(
+	backrestRunCommandHandler := connect.NewUnaryHandler(
 		BackrestRunCommandProcedure,
 		svc.RunCommand,
 		connect.WithSchema(backrestRunCommandMethodDescriptor),
@@ -485,6 +505,12 @@ func NewBackrestHandler(svc BackrestHandler, opts ...connect.HandlerOption) (str
 		BackrestPathAutocompleteProcedure,
 		svc.PathAutocomplete,
 		connect.WithSchema(backrestPathAutocompleteMethodDescriptor),
+		connect.WithHandlerOptions(opts...),
+	)
+	backrestGetSummaryDashboardHandler := connect.NewUnaryHandler(
+		BackrestGetSummaryDashboardProcedure,
+		svc.GetSummaryDashboard,
+		connect.WithSchema(backrestGetSummaryDashboardMethodDescriptor),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/v1.Backrest/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -523,6 +549,8 @@ func NewBackrestHandler(svc BackrestHandler, opts ...connect.HandlerOption) (str
 			backrestClearHistoryHandler.ServeHTTP(w, r)
 		case BackrestPathAutocompleteProcedure:
 			backrestPathAutocompleteHandler.ServeHTTP(w, r)
+		case BackrestGetSummaryDashboardProcedure:
+			backrestGetSummaryDashboardHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -580,12 +608,12 @@ func (UnimplementedBackrestHandler) Cancel(context.Context, *connect.Request[typ
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.Cancel is not implemented"))
 }
 
-func (UnimplementedBackrestHandler) GetLogs(context.Context, *connect.Request[v1.LogDataRequest]) (*connect.Response[types.BytesValue], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.GetLogs is not implemented"))
+func (UnimplementedBackrestHandler) GetLogs(context.Context, *connect.Request[v1.LogDataRequest], *connect.ServerStream[types.BytesValue]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.GetLogs is not implemented"))
 }
 
-func (UnimplementedBackrestHandler) RunCommand(context.Context, *connect.Request[v1.RunCommandRequest], *connect.ServerStream[types.BytesValue]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.RunCommand is not implemented"))
+func (UnimplementedBackrestHandler) RunCommand(context.Context, *connect.Request[v1.RunCommandRequest]) (*connect.Response[types.Int64Value], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.RunCommand is not implemented"))
 }
 
 func (UnimplementedBackrestHandler) GetDownloadURL(context.Context, *connect.Request[types.Int64Value]) (*connect.Response[types.StringValue], error) {
@@ -598,4 +626,8 @@ func (UnimplementedBackrestHandler) ClearHistory(context.Context, *connect.Reque
 
 func (UnimplementedBackrestHandler) PathAutocomplete(context.Context, *connect.Request[types.StringValue]) (*connect.Response[types.StringList], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.PathAutocomplete is not implemented"))
+}
+
+func (UnimplementedBackrestHandler) GetSummaryDashboard(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[v1.SummaryDashboardResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("v1.Backrest.GetSummaryDashboard is not implemented"))
 }

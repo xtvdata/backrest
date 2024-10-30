@@ -1,19 +1,14 @@
 package tasks
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
-	"github.com/garethgeorge/backrest/internal/ioutil"
 	"github.com/garethgeorge/backrest/internal/oplog"
-	"github.com/garethgeorge/backrest/internal/oplog/indexutil"
 	"github.com/garethgeorge/backrest/internal/protoutil"
-	"go.uber.org/zap"
 )
 
 type CheckTask struct {
@@ -25,6 +20,7 @@ type CheckTask struct {
 func NewCheckTask(repoID, planID string, force bool) Task {
 	return &CheckTask{
 		BaseTask: BaseTask{
+			TaskType:   "check",
 			TaskName:   fmt.Sprintf("check for repo %q", repoID),
 			TaskRepoID: repoID,
 			TaskPlanID: planID,
@@ -59,8 +55,12 @@ func (t *CheckTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error
 
 	var lastRan time.Time
 	var foundBackup bool
-	if err := runner.OpLog().ForEach(oplog.Query{RepoId: t.RepoID()}, indexutil.Reversed(indexutil.CollectAll()), func(op *v1.Operation) error {
-		if _, ok := op.Op.(*v1.Operation_OperationCheck); ok {
+
+	if err := runner.OpLog().Query(oplog.Query{RepoID: t.RepoID(), Reversed: true}, func(op *v1.Operation) error {
+		if op.Status == v1.OperationStatus_STATUS_PENDING || op.Status == v1.OperationStatus_STATUS_SYSTEM_CANCELLED {
+			return nil
+		}
+		if _, ok := op.Op.(*v1.Operation_OperationCheck); ok && op.UnixTimeEndMs != 0 {
 			lastRan = time.Unix(0, op.UnixTimeEndMs*int64(time.Millisecond))
 			return oplog.ErrStopIteration
 		}
@@ -71,10 +71,10 @@ func (t *CheckTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error
 	}); err != nil {
 		return NeverScheduledTask, fmt.Errorf("finding last check run time: %w", err)
 	} else if !foundBackup {
-		lastRan = time.Now()
+		lastRan = now
 	}
 
-	runAt, err := protoutil.ResolveSchedule(repo.CheckPolicy.GetSchedule(), lastRan)
+	runAt, err := protoutil.ResolveSchedule(repo.CheckPolicy.GetSchedule(), lastRan, now)
 	if errors.Is(err, protoutil.ErrScheduleDisabled) {
 		return NeverScheduledTask, nil
 	} else if err != nil {
@@ -114,38 +114,19 @@ func (t *CheckTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunner
 	}
 	op.Op = opCheck
 
-	ctx, cancel := context.WithCancel(ctx)
-	interval := time.NewTicker(1 * time.Second)
-	defer interval.Stop()
-	buf := bytes.NewBuffer(nil)
-	bufWriter := &ioutil.SynchronizedWriter{W: &ioutil.LimitWriter{W: buf, N: 16 * 1024}}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-interval.C:
-				bufWriter.Mu.Lock()
-				output := buf.String()
-				bufWriter.Mu.Unlock()
+	liveID, writer, err := runner.LogrefWriter()
+	if err != nil {
+		return fmt.Errorf("create logref writer: %w", err)
+	}
+	defer writer.Close()
+	opCheck.OperationCheck.OutputLogref = liveID
 
-				if opCheck.OperationCheck.Output != string(output) {
-					opCheck.OperationCheck.Output = string(output)
+	if err := runner.UpdateOperation(op); err != nil {
+		return fmt.Errorf("update operation: %w", err)
+	}
 
-					if err := runner.OpLog().Update(op); err != nil {
-						zap.L().Error("update prune operation with status output", zap.Error(err))
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	if err := repo.Check(ctx, bufWriter); err != nil {
-		cancel()
-
+	err = repo.Check(ctx, writer)
+	if err != nil {
 		runner.ExecuteHooks(ctx, []v1.Hook_Condition{
 			v1.Hook_CONDITION_CHECK_ERROR,
 			v1.Hook_CONDITION_ANY_ERROR,
@@ -153,22 +134,17 @@ func (t *CheckTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunner
 			Error: err.Error(),
 		})
 
-		return fmt.Errorf("prune: %w", err)
+		return fmt.Errorf("check: %w", err)
 	}
-	cancel()
-	wg.Wait()
 
-	opCheck.OperationCheck.Output = string(buf.Bytes())
-
-	// Run a stats task after a successful prune
-	if err := runner.ScheduleTask(NewStatsTask(t.RepoID(), PlanForSystemTasks, false), TaskPriorityStats); err != nil {
-		zap.L().Error("schedule stats task", zap.Error(err))
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("close logref writer: %w", err)
 	}
 
 	if err := runner.ExecuteHooks(ctx, []v1.Hook_Condition{
 		v1.Hook_CONDITION_CHECK_SUCCESS,
 	}, HookVars{}); err != nil {
-		return fmt.Errorf("execute prune success hooks: %w", err)
+		return fmt.Errorf("execute check success hooks: %w", err)
 	}
 
 	return nil

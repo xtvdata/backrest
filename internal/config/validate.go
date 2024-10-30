@@ -17,6 +17,10 @@ import (
 func ValidateConfig(c *v1.Config) error {
 	var err error
 
+	if e := validateAuth(c.Auth); e != nil {
+		err = multierror.Append(err, fmt.Errorf("auth: %w", e))
+	}
+
 	if e := validationutil.ValidateID(c.Instance, validationutil.IDMaxLen); e != nil {
 		if errors.Is(e, validationutil.ErrEmpty) {
 			zap.L().Warn("ACTION REQUIRED: instance ID is empty, will be required in a future update. Please open the backrest UI to set a unique instance ID. Until fixed this warning (and related errors) will print periodically.")
@@ -107,7 +111,7 @@ func validatePlan(plan *v1.Plan, repos map[string]*v1.Repo) error {
 
 	if plan.Schedule != nil {
 		if e := protoutil.ValidateSchedule(plan.Schedule); e != nil {
-			err = multierror.Append(err, fmt.Errorf("schedule: %w", e))
+			err = multierror.Append(err, fmt.Errorf("backup schedule: %w", e))
 		}
 	}
 
@@ -136,4 +140,25 @@ func validatePlan(plan *v1.Plan, repos map[string]*v1.Repo) error {
 	slices.Sort(plan.Paths)
 
 	return err
+}
+
+func validateAuth(auth *v1.Auth) error {
+	if auth == nil || auth.Disabled {
+		return nil
+	}
+
+	if len(auth.Users) == 0 {
+		return errors.New("auth enabled but no users")
+	}
+
+	for _, user := range auth.Users {
+		if e := validationutil.ValidateID(user.Name, 0); e != nil {
+			return fmt.Errorf("user %q: %w", user.Name, e)
+		}
+		if user.GetPasswordBcrypt() == "" {
+			return fmt.Errorf("user %q: password is required", user.Name)
+		}
+	}
+
+	return nil
 }

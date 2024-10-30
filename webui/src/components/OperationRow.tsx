@@ -17,24 +17,14 @@ import {
 } from "antd";
 import type { ItemType } from "rc-collapse/es/interface";
 import {
-  PaperClipOutlined,
-  SaveOutlined,
-  DeleteOutlined,
-  DownloadOutlined,
-  RobotOutlined,
-  InfoCircleOutlined,
-  FileSearchOutlined,
-} from "@ant-design/icons";
-import { BackupProgressEntry, ResticSnapshot } from "../../gen/ts/v1/restic_pb";
-import {
-  DisplayType,
-  detailsForOperation,
-  displayTypeToString,
-  getTypeForDisplay,
-} from "../state/oplog";
+  BackupProgressEntry,
+  ResticSnapshot,
+  SnapshotSummary,
+} from "../../gen/ts/v1/restic_pb";
 import { SnapshotBrowser } from "./SnapshotBrowser";
 import {
   formatBytes,
+  formatDuration,
   formatTime,
   normalizeSnapshotId,
 } from "../lib/formatting";
@@ -43,10 +33,15 @@ import { LogDataRequest } from "../../gen/ts/v1/service_pb";
 import { MessageInstance } from "antd/es/message/interface";
 import { backrestService } from "../api";
 import { useShowModal } from "./ModalManager";
-import { proto3 } from "@bufbuild/protobuf";
-import { Hook_Condition } from "../../gen/ts/v1/config_pb";
 import { useAlertApi } from "./Alerts";
 import { OperationList } from "./OperationList";
+import {
+  displayTypeToString,
+  getTypeForDisplay,
+  nameForStatus,
+} from "../state/flowdisplayaggregator";
+import { OperationIcon } from "./OperationIcon";
+import { LogView } from "./LogView";
 
 export const OperationRow = ({
   operation,
@@ -60,7 +55,6 @@ export const OperationRow = ({
   hookOperations?: Operation[];
 }>) => {
   const showModal = useShowModal();
-  const details = detailsForOperation(operation);
   const displayType = getTypeForDisplay(operation);
   const setRefresh = useState(0)[1];
 
@@ -72,43 +66,6 @@ export const OperationRow = ({
       return () => clearInterval(interval);
     }
   }, [operation.status]);
-
-  let avatar: React.ReactNode;
-  switch (displayType) {
-    case DisplayType.BACKUP:
-      avatar = (
-        <SaveOutlined
-          style={{ color: details.color }}
-          spin={operation.status === OperationStatus.STATUS_INPROGRESS}
-        />
-      );
-      break;
-    case DisplayType.FORGET:
-      avatar = (
-        <DeleteOutlined
-          style={{ color: details.color }}
-          spin={operation.status === OperationStatus.STATUS_INPROGRESS}
-        />
-      );
-      break;
-    case DisplayType.SNAPSHOT:
-      avatar = <PaperClipOutlined style={{ color: details.color }} />;
-      break;
-    case DisplayType.RESTORE:
-      avatar = <DownloadOutlined style={{ color: details.color }} />;
-      break;
-    case DisplayType.PRUNE:
-      avatar = <DeleteOutlined style={{ color: details.color }} />;
-      break;
-    case DisplayType.CHECK:
-      avatar = <FileSearchOutlined style={{ color: details.color }} />;
-    case DisplayType.RUNHOOK:
-      avatar = <RobotOutlined style={{ color: details.color }} />;
-      break;
-    case DisplayType.STATS:
-      avatar = <InfoCircleOutlined style={{ color: details.color }} />;
-      break;
-  }
 
   const doCancel = () => {
     backrestService
@@ -137,21 +94,36 @@ export const OperationRow = ({
           showModal(null);
         }}
       >
-        <BigOperationDataVerbatim logref={operation.logref!} />
+        <LogView logref={operation.logref!} />
       </Modal>
     );
   };
+
+  let details: string = "";
+  if (operation.status !== OperationStatus.STATUS_SUCCESS) {
+    details = nameForStatus(operation.status);
+  }
+  if (operation.unixTimeEndMs - operation.unixTimeStartMs > 100) {
+    details +=
+      " in " +
+      formatDuration(
+        Number(operation.unixTimeEndMs - operation.unixTimeStartMs)
+      );
+  }
 
   const opName = displayTypeToString(getTypeForDisplay(operation));
   let title = (
     <>
       {showPlan ? operation.planId + " - " : undefined}{" "}
       {formatTime(Number(operation.unixTimeStartMs))} - {opName}{" "}
-      <span className="backrest operation-details">{details.displayState}</span>
+      <span className="backrest operation-details">{details}</span>
     </>
   );
 
-  if (operation.status == OperationStatus.STATUS_INPROGRESS) {
+  if (
+    operation.status === OperationStatus.STATUS_INPROGRESS ||
+    operation.status === OperationStatus.STATUS_PENDING
+  ) {
     title = (
       <>
         {title}
@@ -191,7 +163,9 @@ export const OperationRow = ({
   const expandedBodyItems: string[] = [];
 
   if (operation.op.case === "operationBackup") {
-    expandedBodyItems.push("details");
+    if (operation.status === OperationStatus.STATUS_INPROGRESS) {
+      expandedBodyItems.push("details");
+    }
     const backupOp = operation.op.value;
     bodyItems.push({
       key: "details",
@@ -238,17 +212,45 @@ export const OperationRow = ({
     });
   } else if (operation.op.case === "operationPrune") {
     const prune = operation.op.value;
+    expandedBodyItems.push("prune");
     bodyItems.push({
       key: "prune",
       label: "Prune Output",
-      children: <pre>{prune.output}</pre>,
+      children: prune.outputLogref ? (
+        <LogView logref={prune.outputLogref} />
+      ) : (
+        <pre>{prune.output}</pre>
+      ),
     });
   } else if (operation.op.case === "operationCheck") {
     const check = operation.op.value;
+    expandedBodyItems.push("check");
     bodyItems.push({
       key: "check",
       label: "Check Output",
-      children: <pre>{check.output}</pre>,
+      children: check.outputLogref ? (
+        <LogView logref={check.outputLogref} />
+      ) : (
+        <pre>{check.output}</pre>
+      ),
+    });
+  } else if (operation.op.case === "operationRunCommand") {
+    const run = operation.op.value;
+    if (run.outputSizeBytes < 64 * 1024) {
+      expandedBodyItems.push("run");
+    }
+    bodyItems.push({
+      key: "run",
+      label:
+        "Command Output" +
+        (run.outputSizeBytes > 0
+          ? ` (${formatBytes(Number(run.outputSizeBytes))})`
+          : ""),
+      children: (
+        <>
+          <LogView logref={run.outputLogref} />
+        </>
+      ),
     });
   } else if (operation.op.case === "operationRestore") {
     expandedBodyItems.push("restore");
@@ -260,10 +262,13 @@ export const OperationRow = ({
   } else if (operation.op.case === "operationRunHook") {
     const hook = operation.op.value;
     if (operation.logref) {
+      if (operation.status === OperationStatus.STATUS_INPROGRESS) {
+        expandedBodyItems.push("logref");
+      }
       bodyItems.push({
         key: "logref",
         label: "Hook Output",
-        children: <BigOperationDataVerbatim logref={operation.logref} />,
+        children: <LogView logref={operation.logref} />,
       });
     }
   }
@@ -272,7 +277,12 @@ export const OperationRow = ({
     bodyItems.push({
       key: "hookOperations",
       label: "Hooks Triggered",
-      children: <OperationList useOperations={hookOperations} />,
+      children: (
+        <OperationList
+          useOperations={hookOperations}
+          displayHooksInline={true}
+        />
+      ),
     });
 
     for (const op of hookOperations) {
@@ -287,13 +297,14 @@ export const OperationRow = ({
     <List.Item key={operation.id}>
       <List.Item.Meta
         title={title}
-        avatar={avatar}
+        avatar={<OperationIcon type={displayType} status={operation.status} />}
         description={
           <>
             {operation.displayMessage && (
               <div key="message">
                 <pre>
-                  {details.state ? details.state + ": " : null}
+                  {operation.status !== OperationStatus.STATUS_SUCCESS &&
+                    nameForStatus(operation.status) + ": "}
                   {displayMessage}
                 </pre>
               </div>
@@ -312,29 +323,78 @@ export const OperationRow = ({
 };
 
 const SnapshotDetails = ({ snapshot }: { snapshot: ResticSnapshot }) => {
+  const summary: Partial<SnapshotSummary> = snapshot.summary || {};
+
+  const rows: React.ReactNode[] = [
+    <Row gutter={16} key={1}>
+      <Col span={8}>
+        <Typography.Text strong>User and Host</Typography.Text>
+        <br />
+        {snapshot.username}@{snapshot.hostname}
+      </Col>
+      <Col span={12}>
+        <Typography.Text strong>Tags</Typography.Text>
+        <br />
+        {snapshot.tags.join(", ")}
+      </Col>
+    </Row>,
+  ];
+
+  if (
+    summary.filesNew ||
+    summary.filesChanged ||
+    summary.filesUnmodified ||
+    summary.dataAdded ||
+    summary.totalFilesProcessed ||
+    summary.totalBytesProcessed
+  ) {
+    rows.push(
+      <Row gutter={16} key={2}>
+        <Col span={8}>
+          <Typography.Text strong>Files Added</Typography.Text>
+          <br />
+          {"" + summary.filesNew}
+        </Col>
+        <Col span={8}>
+          <Typography.Text strong>Files Changed</Typography.Text>
+          <br />
+          {"" + summary.filesChanged}
+        </Col>
+        <Col span={8}>
+          <Typography.Text strong>Files Unmodified</Typography.Text>
+          <br />
+          {"" + summary.filesUnmodified}
+        </Col>
+      </Row>
+    );
+    rows.push(
+      <Row gutter={16} key={3}>
+        <Col span={8}>
+          <Typography.Text strong>Bytes Added</Typography.Text>
+          <br />
+          {formatBytes(Number(summary.dataAdded))}
+        </Col>
+        <Col span={8}>
+          <Typography.Text strong>Bytes Processed</Typography.Text>
+          <br />
+          {formatBytes(Number(summary.totalBytesProcessed))}
+        </Col>
+        <Col span={8}>
+          <Typography.Text strong>Files Processed</Typography.Text>
+          <br />
+          {"" + summary.totalFilesProcessed}
+        </Col>
+      </Row>
+    );
+  }
+
   return (
     <>
       <Typography.Text>
         <Typography.Text strong>Snapshot ID: </Typography.Text>
-        {normalizeSnapshotId(snapshot.id!)}
+        {normalizeSnapshotId(snapshot.id!)} <br />
+        {rows}
       </Typography.Text>
-      <Row gutter={16}>
-        <Col span={8}>
-          <Typography.Text strong>Host</Typography.Text>
-          <br />
-          {snapshot.hostname}
-        </Col>
-        <Col span={8}>
-          <Typography.Text strong>Username</Typography.Text>
-          <br />
-          {snapshot.hostname}
-        </Col>
-        <Col span={8}>
-          <Typography.Text strong>Tags</Typography.Text>
-          <br />
-          {snapshot.tags?.join(", ")}
-        </Col>
-      </Row>
     </>
   );
 };
@@ -350,10 +410,7 @@ const RestoreOperationStatus = ({ operation }: { operation: Operation }) => {
     <>
       Restore {restoreOp.path} to {restoreOp.target}
       {!isDone ? (
-        <Progress
-          percent={Math.round(progress * 1000) / 1000}
-          status="active"
-        />
+        <Progress percent={Math.round(progress * 1000) / 10} status="active" />
       ) : null}
       {operation.status == OperationStatus.STATUS_SUCCESS ? (
         <>
@@ -438,7 +495,9 @@ const BackupOperationStatus = ({
       <>
         <Typography.Text>
           <Typography.Text strong>Snapshot ID: </Typography.Text>
-          {normalizeSnapshotId(sum.snapshotId!)}
+          {sum.snapshotId !== ""
+            ? normalizeSnapshotId(sum.snapshotId!)
+            : "No Snapshot Created"}
         </Typography.Text>
         <Row gutter={16}>
           <Col span={8}>
@@ -489,23 +548,29 @@ const ForgetOperationDetails = ({
 }) => {
   const policy = forgetOp.policy! || {};
   const policyDesc = [];
-  if (policy.keepLastN) {
-    policyDesc.push(`Keep Last ${policy.keepLastN} Snapshots`);
-  }
-  if (policy.keepHourly) {
-    policyDesc.push(`Keep Hourly for ${policy.keepHourly} Hours`);
-  }
-  if (policy.keepDaily) {
-    policyDesc.push(`Keep Daily for ${policy.keepDaily} Days`);
-  }
-  if (policy.keepWeekly) {
-    policyDesc.push(`Keep Weekly for ${policy.keepWeekly} Weeks`);
-  }
-  if (policy.keepMonthly) {
-    policyDesc.push(`Keep Monthly for ${policy.keepMonthly} Months`);
-  }
-  if (policy.keepYearly) {
-    policyDesc.push(`Keep Yearly for ${policy.keepYearly} Years`);
+  if (policy.policy) {
+    if (policy.policy.case === "policyKeepAll") {
+      policyDesc.push("Keep all.");
+    } else if (policy.policy.case === "policyKeepLastN") {
+      policyDesc.push(`Keep last ${policy.policy.value} snapshots`);
+    } else if (policy.policy.case == "policyTimeBucketed") {
+      const val = policy.policy.value;
+      if (val.hourly) {
+        policyDesc.push(`Keep hourly for ${val.hourly} hours`);
+      }
+      if (val.daily) {
+        policyDesc.push(`Keep daily for ${val.daily} days`);
+      }
+      if (val.weekly) {
+        policyDesc.push(`Keep weekly for ${val.weekly} weeks`);
+      }
+      if (val.monthly) {
+        policyDesc.push(`Keep monthly for ${val.monthly} months`);
+      }
+      if (val.yearly) {
+        policyDesc.push(`Keep yearly for ${val.yearly} years`);
+      }
+    }
   }
 
   return (
@@ -522,37 +587,12 @@ const ForgetOperationDetails = ({
           </div>
         ))}
       </pre>
-      {/* Policy:
-            <ul>
-              {policyDesc.map((desc, idx) => (
-                <li key={idx}>{desc}</li>
-              ))}
-            </ul> */}
+      Policy:
+      <ul>
+        {policyDesc.map((desc, idx) => (
+          <li key={idx}>{desc}</li>
+        ))}
+      </ul>
     </>
   );
-};
-
-// TODO: refactor this to use the provider pattern
-const BigOperationDataVerbatim = ({ logref }: { logref: string }) => {
-  const [output, setOutput] = useState<string | undefined>(undefined);
-
-  useEffect(() => {
-    if (!logref) {
-      return;
-    }
-    backrestService
-      .getLogs(
-        new LogDataRequest({
-          ref: logref,
-        })
-      )
-      .then((resp) => {
-        setOutput(new TextDecoder("utf-8").decode(resp.value));
-      })
-      .catch((e) => {
-        console.error("Failed to fetch hook output: ", e);
-      });
-  }, [logref]);
-
-  return <pre style={{ whiteSpace: "pre" }}>{output}</pre>;
 };

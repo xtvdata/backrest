@@ -1,21 +1,24 @@
 import {
   Checkbox,
-  Col,
   Form,
   InputNumber,
   Radio,
   Row,
-  Segmented,
   Tooltip,
+  Typography,
 } from "antd";
-import { NamePath } from "antd/es/form/interface";
 import React from "react";
-import Cron from "react-js-cron";
+import Cron, { CronType, PeriodType } from "react-js-cron";
+import { Schedule_Clock } from "../../gen/ts/v1/config_pb";
+import { proto3 } from "@bufbuild/protobuf";
 
 interface ScheduleDefaults {
   maxFrequencyDays: number;
   maxFrequencyHours: number;
   cron: string;
+  cronPeriods?: PeriodType[];
+  cronDropdowns?: CronType[];
+  clock: Schedule_Clock;
 }
 
 export const ScheduleDefaultsInfrequent: ScheduleDefaults = {
@@ -23,6 +26,9 @@ export const ScheduleDefaultsInfrequent: ScheduleDefaults = {
   maxFrequencyHours: 30 * 24,
   // midnight on the first day of the month
   cron: "0 0 1 * *",
+  cronDropdowns: ["period", "months", "month-days", "week-days", "hours"],
+  cronPeriods: ["month", "week"],
+  clock: Schedule_Clock.LAST_RUN_TIME,
 };
 
 export const ScheduleDefaultsDaily: ScheduleDefaults = {
@@ -30,32 +36,54 @@ export const ScheduleDefaultsDaily: ScheduleDefaults = {
   maxFrequencyHours: 24,
   // midnight every day
   cron: "0 0 * * *",
+  cronDropdowns: [
+    "period",
+    "months",
+    "month-days",
+    "hours",
+    "minutes",
+    "week-days",
+  ],
+  cronPeriods: ["day", "hour", "month", "week"],
+  clock: Schedule_Clock.LOCAL,
 };
 
+type SchedulingMode =
+  | ""
+  | "disabled"
+  | "maxFrequencyDays"
+  | "maxFrequencyHours"
+  | "cron";
 export const ScheduleFormItem = ({
   name,
   defaults,
 }: {
   name: string[];
-  defaults?: ScheduleDefaults;
+  defaults: ScheduleDefaults;
 }) => {
   const form = Form.useFormInstance();
-  const retention = Form.useWatch(name, { form, preserve: true }) as any;
+  const schedule = Form.useWatch(name, { form, preserve: true }) as any;
 
-  defaults = defaults || ScheduleDefaultsInfrequent;
+  if (schedule !== undefined && schedule.clock === undefined) {
+    form.setFieldValue(
+      name.concat("clock"),
+      clockEnumValueToString(defaults.clock)
+    );
+  }
 
-  const determineMode = () => {
-    if (!retention) {
+  const determineMode = (): SchedulingMode => {
+    if (!schedule) {
       return "";
-    } else if (retention.disabled) {
+    } else if (schedule.disabled) {
       return "disabled";
-    } else if (retention.maxFrequencyDays) {
+    } else if (schedule.maxFrequencyDays) {
       return "maxFrequencyDays";
-    } else if (retention.maxFrequencyHours) {
+    } else if (schedule.maxFrequencyHours) {
       return "maxFrequencyHours";
-    } else if (retention.cron) {
+    } else if (schedule.cron) {
       return "cron";
     }
+    return "";
   };
 
   const mode = determineMode();
@@ -79,15 +107,8 @@ export const ScheduleFormItem = ({
           setValue={(val: string) => {
             form.setFieldValue(name.concat(["cron"]), val);
           }}
-          allowedDropdowns={[
-            "period",
-            "months",
-            "month-days",
-            "hours",
-            "minutes",
-            "week-days",
-          ]}
-          allowedPeriods={["day", "hour", "month", "week"]}
+          allowedDropdowns={defaults.cronDropdowns}
+          allowedPeriods={defaults.cronPeriods}
           clearButton={false}
         />
       </Form.Item>
@@ -108,6 +129,7 @@ export const ScheduleFormItem = ({
         <InputNumber
           addonBefore={<div style={{ width: "10em" }}>Interval in Days</div>}
           type="number"
+          min={1}
         />
       </Form.Item>
     );
@@ -127,6 +149,7 @@ export const ScheduleFormItem = ({
         <InputNumber
           addonBefore={<div style={{ width: "10em" }}>Interval in Hours</div>}
           type="number"
+          min={1}
         />
       </Form.Item>
     );
@@ -160,6 +183,12 @@ export const ScheduleFormItem = ({
               });
             } else if (selected === "cron") {
               form.setFieldValue(name, { cron: defaults!.cron });
+            } else if (selected === "minHoursSinceLastRun") {
+              form.setFieldValue(name, { minHoursSinceLastRun: 1 });
+            } else if (selected === "minDaysSinceLastRun") {
+              form.setFieldValue(name, { minDaysSinceLastRun: 1 });
+            } else if (selected === "cronSinceLastRun") {
+              form.setFieldValue(name, { cronSinceLastRun: defaults!.cron });
             } else {
               form.setFieldValue(name, { disabled: true });
             }
@@ -171,13 +200,13 @@ export const ScheduleFormItem = ({
             </Tooltip>
           </Radio.Button>
           <Radio.Button value={"maxFrequencyHours"}>
-            <Tooltip title="Schedule will run at the specified interval in hours (e.g. N hours after the last run).">
-              Max Frequency Hours
+            <Tooltip title="Schedule will run at the specified interval in hours.">
+              Interval Hours
             </Tooltip>
           </Radio.Button>
           <Radio.Button value={"maxFrequencyDays"}>
-            <Tooltip title="Schedule will run at the specified interval in days (e.g. N days after the last run).">
-              Max Frequency Days
+            <Tooltip title="Schedule will run at the specified interval in days.">
+              Interval Days
             </Tooltip>
           </Radio.Button>
           <Radio.Button value={"cron"}>
@@ -186,6 +215,43 @@ export const ScheduleFormItem = ({
             </Tooltip>
           </Radio.Button>
         </Radio.Group>
+        <Typography.Text style={{ marginLeft: "1em", marginRight: "1em" }}>
+          Clock for schedule:{" "}
+        </Typography.Text>
+        <Tooltip
+          title={
+            <>
+              Clock provides the time that the schedule is evaluated relative
+              to.
+              <ul>
+                <li>Local - current time in the local timezone.</li>
+                <li>UTC - current time in the UTC timezone.</li>
+                <li>
+                  Last Run Time - relative to the last time the task ran. Good
+                  for devices that aren't always powered on e.g. laptops.
+                </li>
+              </ul>
+            </>
+          }
+        >
+          <Form.Item name={name.concat("clock")}>
+            <Radio.Group>
+              <Radio.Button
+                value={clockEnumValueToString(Schedule_Clock.LOCAL)}
+              >
+                Local
+              </Radio.Button>
+              <Radio.Button value={clockEnumValueToString(Schedule_Clock.UTC)}>
+                UTC
+              </Radio.Button>
+              <Radio.Button
+                value={clockEnumValueToString(Schedule_Clock.LAST_RUN_TIME)}
+              >
+                Last Run Time
+              </Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+        </Tooltip>
       </Row>
       <div style={{ height: "0.5em" }} />
       <Row>
@@ -194,3 +260,6 @@ export const ScheduleFormItem = ({
     </>
   );
 };
+
+const clockEnumValueToString = (clock: Schedule_Clock) =>
+  proto3.getEnumType(Schedule_Clock).findNumber(clock)!.name;

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
+	"github.com/garethgeorge/backrest/internal/orchestrator/logging"
 	"github.com/garethgeorge/backrest/internal/protoutil"
 	"github.com/garethgeorge/backrest/pkg/restic"
 	"github.com/google/shlex"
@@ -23,11 +26,9 @@ import (
 type RepoOrchestrator struct {
 	mu sync.Mutex
 
-	l           *zap.Logger
-	config      *v1.Config
-	repoConfig  *v1.Repo
-	repo        *restic.Repo
-	initialized bool
+	config     *v1.Config
+	repoConfig *v1.Repo
+	repo       *restic.Repo
 }
 
 // NewRepoOrchestrator accepts a config and a repo that is configured with the properties of that config object.
@@ -50,7 +51,7 @@ func NewRepoOrchestrator(config *v1.Config, repoConfig *v1.Repo, resticPath stri
 	}
 
 	for _, f := range repoConfig.GetFlags() {
-		args, err := shlex.Split(f)
+		args, err := shlex.Split(ExpandEnv(f))
 		if err != nil {
 			return nil, fmt.Errorf("parse flag %q for repo %q: %w", f, repoConfig.Id, err)
 		}
@@ -77,8 +78,11 @@ func NewRepoOrchestrator(config *v1.Config, repoConfig *v1.Repo, resticPath stri
 		config:     config,
 		repoConfig: repoConfig,
 		repo:       repo,
-		l:          zap.L().With(zap.String("repo", repoConfig.Id)),
 	}, nil
+}
+
+func (r *RepoOrchestrator) logger(ctx context.Context) *zap.Logger {
+	return logging.Logger(ctx, "[repo-manager] ").With(zap.String("repo", r.repoConfig.Id))
 }
 
 func (r *RepoOrchestrator) Init(ctx context.Context) error {
@@ -118,24 +122,18 @@ func (r *RepoOrchestrator) SnapshotsForPlan(ctx context.Context, plan *v1.Plan) 
 }
 
 func (r *RepoOrchestrator) Backup(ctx context.Context, plan *v1.Plan, progressCallback func(event *restic.BackupProgressEntry)) (*restic.BackupProgressEntry, error) {
-	zap.L().Debug("repo orchestrator starting backup", zap.String("repo", r.repoConfig.Id))
+	l := r.logger(ctx)
+	l.Debug("repo orchestrator starting backup", zap.String("repo", r.repoConfig.Id))
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	if !r.initialized {
-		if err := r.repo.Init(ctx); err != nil {
-			return nil, fmt.Errorf("failed to initialize repo: %w", err)
-		}
-		r.initialized = true
-	}
 
 	snapshots, err := r.SnapshotsForPlan(ctx, plan)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get snapshots for plan: %w", err)
 	}
 
-	r.l.Debug("got snapshots for plan", zap.String("repo", r.repoConfig.Id), zap.Int("count", len(snapshots)), zap.String("plan", plan.Id), zap.String("tag", TagForPlan(plan.Id)))
+	l.Debug("got snapshots for plan", zap.String("repo", r.repoConfig.Id), zap.Int("count", len(snapshots)), zap.String("plan", plan.Id), zap.String("tag", TagForPlan(plan.Id)))
 
 	startTime := time.Now()
 
@@ -171,13 +169,13 @@ func (r *RepoOrchestrator) Backup(ctx context.Context, plan *v1.Plan, progressCa
 
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
-	r.l.Debug("starting backup", zap.String("repo", r.repoConfig.Id), zap.String("plan", plan.Id))
+	l.Debug("starting backup", zap.String("plan", plan.Id))
 	summary, err := r.repo.Backup(ctx, plan.Paths, progressCallback, opts...)
 	if err != nil {
 		return summary, fmt.Errorf("failed to backup: %w", err)
 	}
 
-	r.l.Debug("backup completed", zap.String("repo", r.repoConfig.Id), zap.Duration("duration", time.Since(startTime)))
+	l.Debug("backup completed", zap.Duration("duration", time.Since(startTime)))
 	return summary, nil
 }
 
@@ -227,7 +225,7 @@ func (r *RepoOrchestrator) Forget(ctx context.Context, plan *v1.Plan, tags []str
 		forgotten = append(forgotten, snapshotProto)
 	}
 
-	zap.L().Debug("forget snapshots", zap.String("plan", plan.Id), zap.Int("count", len(forgotten)), zap.Any("policy", policy))
+	r.logger(ctx).Debug("forget snapshots", zap.String("plan", plan.Id), zap.Int("count", len(forgotten)), zap.Any("policy", policy))
 
 	return forgotten, nil
 }
@@ -238,7 +236,7 @@ func (r *RepoOrchestrator) ForgetSnapshot(ctx context.Context, snapshotId string
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	r.l.Debug("forget snapshot with ID", zap.String("snapshot", snapshotId), zap.String("repo", r.repoConfig.Id))
+	r.logger(ctx).Debug("forget snapshot with ID", zap.String("snapshot", snapshotId), zap.String("repo", r.repoConfig.Id))
 	return r.repo.ForgetSnapshot(ctx, snapshotId)
 }
 
@@ -262,7 +260,7 @@ func (r *RepoOrchestrator) Prune(ctx context.Context, output io.Writer) error {
 		opts = append(opts, restic.WithFlags("--max-unused", fmt.Sprintf("%v%%", policy.MaxUnusedPercent)))
 	}
 
-	r.l.Debug("prune snapshots")
+	r.logger(ctx).Debug("prune snapshots")
 	err := r.repo.Prune(ctx, output, opts...)
 	if err != nil {
 		return fmt.Errorf("prune snapshots for repo %v: %w", r.repoConfig.Id, err)
@@ -281,14 +279,14 @@ func (r *RepoOrchestrator) Check(ctx context.Context, output io.Writer) error {
 		switch m := r.repoConfig.CheckPolicy.Mode.(type) {
 		case *v1.CheckPolicy_ReadDataSubsetPercent:
 			if m.ReadDataSubsetPercent > 0 {
-				opts = append(opts, restic.WithFlags(fmt.Sprintf("--read-data-subset=%v%%", m.ReadDataSubsetPercent)))
+				opts = append(opts, restic.WithFlags(fmt.Sprintf("--read-data-subset=%.4f%%", m.ReadDataSubsetPercent)))
 			}
 		case *v1.CheckPolicy_StructureOnly:
 		default:
 		}
 	}
 
-	r.l.Debug("checking repo")
+	r.logger(ctx).Debug("checking repo")
 	err := r.repo.Check(ctx, output, opts...)
 	if err != nil {
 		return fmt.Errorf("check repo %v: %w", r.repoConfig.Id, err)
@@ -296,18 +294,30 @@ func (r *RepoOrchestrator) Check(ctx context.Context, output io.Writer) error {
 	return nil
 }
 
-func (r *RepoOrchestrator) Restore(ctx context.Context, snapshotId string, path string, target string, progressCallback func(event *v1.RestoreProgressEntry)) (*v1.RestoreProgressEntry, error) {
+func (r *RepoOrchestrator) Restore(ctx context.Context, snapshotId string, snapshotPath string, target string, progressCallback func(event *v1.RestoreProgressEntry)) (*v1.RestoreProgressEntry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	r.l.Debug("restore snapshot", zap.String("snapshot", snapshotId), zap.String("target", target))
+	r.logger(ctx).Debug("restore snapshot", zap.String("snapshot", snapshotId), zap.String("target", target))
 
 	var opts []restic.GenericOption
 	opts = append(opts, restic.WithFlags("--target", target))
-	if path != "" {
-		opts = append(opts, restic.WithFlags("--include", path))
+
+	if snapshotPath != "" {
+		if runtime.GOOS == "windows" {
+			opts = append(opts, restic.WithFlags("--include", snapshotPath))
+		} else {
+			dir := path.Dir(snapshotPath)
+			base := path.Base(snapshotPath)
+			if dir != "" {
+				snapshotId = snapshotId + ":" + dir
+			}
+			if base != "" {
+				opts = append(opts, restic.WithFlags("--include", base))
+			}
+		}
 	}
 
 	summary, err := r.repo.Restore(ctx, snapshotId, func(event *restic.RestoreProgressEntry) {
@@ -332,7 +342,7 @@ func (r *RepoOrchestrator) UnlockIfAutoEnabled(ctx context.Context) error {
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	zap.L().Debug("auto-unlocking repo", zap.String("repo", r.repoConfig.Id))
+	r.logger(ctx).Debug("auto-unlocking repo", zap.String("repo", r.repoConfig.Id))
 
 	return r.repo.Unlock(ctx)
 }
@@ -341,7 +351,7 @@ func (r *RepoOrchestrator) Unlock(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.l.Debug("unlocking repo", zap.String("repo", r.repoConfig.Id))
+	r.logger(ctx).Debug("unlocking repo", zap.String("repo", r.repoConfig.Id))
 	r.repo.Unlock(ctx)
 
 	return nil
@@ -353,7 +363,7 @@ func (r *RepoOrchestrator) Stats(ctx context.Context) (*v1.RepoStats, error) {
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	r.l.Debug("getting repo stats", zap.String("repo", r.repoConfig.Id))
+	r.logger(ctx).Debug("getting repo stats", zap.String("repo", r.repoConfig.Id))
 	stats, err := r.repo.Stats(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("stats for repo %v: %w", r.repoConfig.Id, err)
@@ -369,7 +379,7 @@ func (r *RepoOrchestrator) AddTags(ctx context.Context, snapshotIDs []string, ta
 	defer flush()
 
 	for idx, snapshotIDs := range chunkBy(snapshotIDs, 20) {
-		r.l.Debug("adding tag to snapshots", zap.Strings("snapshots", snapshotIDs), zap.Strings("tags", tags))
+		r.logger(ctx).Debug("adding tag to snapshots", zap.Strings("snapshots", snapshotIDs), zap.Strings("tags", tags))
 		if err := r.repo.AddTags(ctx, snapshotIDs, tags); err != nil {
 			return fmt.Errorf("batch %v: %w", idx, err)
 		}
@@ -379,20 +389,19 @@ func (r *RepoOrchestrator) AddTags(ctx context.Context, snapshotIDs []string, ta
 }
 
 // RunCommand runs a command in the repo's environment. Output is buffered and sent to the onProgress callback in batches.
-func (r *RepoOrchestrator) RunCommand(ctx context.Context, command string, onProgress func([]byte)) error {
+func (r *RepoOrchestrator) RunCommand(ctx context.Context, command string, writer io.Writer) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	r.l.Debug("running command", zap.String("command", command))
+	r.logger(ctx).Debug("running command", zap.String("command", command))
 	args, err := shlex.Split(command)
 	if err != nil {
 		return fmt.Errorf("parse command: %w", err)
 	}
 
-	ctx = restic.ContextWithLogger(ctx, &callbackWriter{callback: onProgress})
-
+	ctx = restic.ContextWithLogger(ctx, writer)
 	return r.repo.GenericCommand(ctx, args)
 }
 
@@ -414,13 +423,4 @@ func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {
 		items, chunks = items[chunkSize:], append(chunks, items[0:chunkSize:chunkSize])
 	}
 	return append(chunks, items)
-}
-
-type callbackWriter struct {
-	callback func([]byte) // note: callback must not retain the byte slice
-}
-
-func (w *callbackWriter) Write(p []byte) (n int, err error) {
-	w.callback(p)
-	return len(p), nil
 }

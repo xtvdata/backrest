@@ -1,23 +1,24 @@
 package orchestrator
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 	"time"
 
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/internal/config"
-	"github.com/garethgeorge/backrest/internal/ioutil"
+	"github.com/garethgeorge/backrest/internal/logstore"
+	"github.com/garethgeorge/backrest/internal/metric"
 	"github.com/garethgeorge/backrest/internal/oplog"
 	"github.com/garethgeorge/backrest/internal/orchestrator/logging"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
 	"github.com/garethgeorge/backrest/internal/orchestrator/tasks"
 	"github.com/garethgeorge/backrest/internal/queue"
-	"github.com/garethgeorge/backrest/internal/rotatinglog"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -26,18 +27,19 @@ var ErrRepoNotFound = errors.New("repo not found")
 var ErrRepoInitializationFailed = errors.New("repo initialization failed")
 var ErrPlanNotFound = errors.New("plan not found")
 
+const defaultTaskLogDuration = 14 * 24 * time.Hour
+
 // Orchestrator is responsible for managing repos and backups.
 type Orchestrator struct {
-	mu              sync.Mutex
-	config          *v1.Config
-	OpLog           *oplog.OpLog
-	repoPool        *resticRepoPool
-	taskQueue       *queue.TimePriorityQueue[stContainer]
-	readyTaskQueues map[string]chan tasks.Task
-	logStore        *rotatinglog.RotatingLog
+	mu        sync.Mutex
+	config    *v1.Config
+	OpLog     *oplog.OpLog
+	repoPool  *resticRepoPool
+	taskQueue *queue.TimePriorityQueue[stContainer]
+	logStore  *logstore.LogStore
 
-	// cancelNotify is a list of channels that are notified when a task should be cancelled.
-	cancelNotify []chan int64
+	taskCancelMu sync.Mutex
+	taskCancel   map[int64]context.CancelFunc
 
 	// now for the purpose of testing; used by Run() to get the current time.
 	now func() time.Time
@@ -47,6 +49,7 @@ var _ tasks.TaskExecutor = &Orchestrator{}
 
 type stContainer struct {
 	tasks.ScheduledTask
+	retryCount  int // number of times this task has been retried.
 	configModno int32
 	callbacks   []func(error)
 }
@@ -59,35 +62,57 @@ func (st stContainer) Less(other stContainer) bool {
 	return st.ScheduledTask.Less(other.ScheduledTask)
 }
 
-func NewOrchestrator(resticBin string, cfg *v1.Config, oplog *oplog.OpLog, logStore *rotatinglog.RotatingLog) (*Orchestrator, error) {
+func NewOrchestrator(resticBin string, cfg *v1.Config, log *oplog.OpLog, logStore *logstore.LogStore) (*Orchestrator, error) {
 	cfg = proto.Clone(cfg).(*v1.Config)
 
 	// create the orchestrator.
-	var o *Orchestrator
-	o = &Orchestrator{
-		OpLog:  oplog,
+	o := &Orchestrator{
+		OpLog:  log,
 		config: cfg,
 		// repoPool created with a memory store to ensure the config is updated in an atomic operation with the repo pool's config value.
-		repoPool:  newResticRepoPool(resticBin, cfg),
-		taskQueue: queue.NewTimePriorityQueue[stContainer](),
-		logStore:  logStore,
+		repoPool:   newResticRepoPool(resticBin, cfg),
+		taskQueue:  queue.NewTimePriorityQueue[stContainer](),
+		logStore:   logStore,
+		taskCancel: make(map[int64]context.CancelFunc),
 	}
 
 	// verify the operation log and mark any incomplete operations as failed.
-	if oplog != nil { // oplog may be nil for testing.
-		var incompleteOpRepos []string
-		if err := oplog.Scan(func(incomplete *v1.Operation) {
-			incomplete.Status = v1.OperationStatus_STATUS_ERROR
-			incomplete.DisplayMessage = "Failed, orchestrator killed while operation was in progress."
+	if log != nil { // oplog may be nil for testing.
+		incompleteRepos := []string{}
+		incompleteOps := []*v1.Operation{}
+		toDelete := []int64{}
 
-			if incomplete.RepoId != "" && !slices.Contains(incompleteOpRepos, incomplete.RepoId) {
-				incompleteOpRepos = append(incompleteOpRepos, incomplete.RepoId)
+		startTime := time.Now()
+		zap.S().Info("scrubbing operation log for incomplete operations")
+
+		if err := log.Query(oplog.SelectAll, func(op *v1.Operation) error {
+			if op.Status == v1.OperationStatus_STATUS_PENDING || op.Status == v1.OperationStatus_STATUS_SYSTEM_CANCELLED || op.Status == v1.OperationStatus_STATUS_USER_CANCELLED || op.Status == v1.OperationStatus_STATUS_UNKNOWN {
+				toDelete = append(toDelete, op.Id)
+			} else if op.Status == v1.OperationStatus_STATUS_INPROGRESS {
+				incompleteOps = append(incompleteOps, op)
+				if !slices.Contains(incompleteRepos, op.RepoId) {
+					incompleteRepos = append(incompleteRepos, op.RepoId)
+				}
 			}
+			return nil
 		}); err != nil {
 			return nil, fmt.Errorf("scan oplog: %w", err)
 		}
 
-		for _, repoId := range incompleteOpRepos {
+		for _, op := range incompleteOps {
+			op.Status = v1.OperationStatus_STATUS_ERROR
+			op.DisplayMessage = "Operation was incomplete when orchestrator was restarted."
+			op.UnixTimeEndMs = op.UnixTimeStartMs
+			if err := log.Update(op); err != nil {
+				return nil, fmt.Errorf("update incomplete operation: %w", err)
+			}
+		}
+
+		if err := log.Delete(toDelete...); err != nil {
+			return nil, fmt.Errorf("delete incomplete operations: %w", err)
+		}
+
+		for _, repoId := range incompleteRepos {
 			repo, err := o.GetRepoOrchestrator(repoId)
 			if err != nil {
 				if errors.Is(err, ErrRepoNotFound) {
@@ -100,6 +125,12 @@ func NewOrchestrator(resticBin string, cfg *v1.Config, oplog *oplog.OpLog, logSt
 				zap.L().Error("failed to unlock repo", zap.String("repo", repoId), zap.Error(err))
 			}
 		}
+
+		zap.L().Info("scrubbed operation log for incomplete operations",
+			zap.Duration("duration", time.Since(startTime)),
+			zap.Int("incomplete_ops", len(incompleteOps)),
+			zap.Int("incomplete_repos", len(incompleteRepos)),
+			zap.Int("deleted_ops", len(toDelete)))
 	}
 
 	// apply starting configuration which also queues initial tasks.
@@ -136,30 +167,21 @@ func (o *Orchestrator) ScheduleDefaultTasks(config *v1.Config) error {
 			continue
 		}
 
-		if err := o.cancelHelper(t.Op, v1.OperationStatus_STATUS_SYSTEM_CANCELLED); err != nil {
-			zap.L().Error("failed to cancel queued task", zap.String("task", t.Task.Name()), zap.Error(err))
-		} else {
-			zap.L().Debug("queued task cancelled due to config change", zap.String("task", t.Task.Name()))
+		if err := o.OpLog.Delete(t.Op.Id); err != nil {
+			zap.S().Warnf("failed to cancel pending task %d: %v", t.Op.Id, err)
 		}
 	}
 
-	zap.L().Info("reset task queue, scheduling new task set.")
+	zap.L().Info("reset task queue, scheduling new task set", zap.String("timezone", time.Now().Location().String()))
 
 	// Requeue tasks that are affected by the config change.
-	if err := o.ScheduleTask(tasks.NewCollectGarbageTask(), tasks.TaskPriorityDefault); err != nil {
+	if err := o.ScheduleTask(tasks.NewCollectGarbageTask(o.logStore), tasks.TaskPriorityDefault); err != nil {
 		return fmt.Errorf("schedule collect garbage task: %w", err)
 	}
 
 	for _, plan := range config.Plans {
-		if plan.Disabled {
-			continue
-		}
-
 		// Schedule a backup task for the plan
-		t, err := tasks.NewScheduledBackupTask(plan)
-		if err != nil {
-			return fmt.Errorf("schedule backup task for plan %q: %w", plan.Id, err)
-		}
+		t := tasks.NewScheduledBackupTask(plan)
 		if err := o.ScheduleTask(t, tasks.TaskPriorityDefault); err != nil {
 			return fmt.Errorf("schedule backup task for plan %q: %w", plan.Id, err)
 		}
@@ -216,20 +238,16 @@ func (o *Orchestrator) GetPlan(planID string) (*v1.Plan, error) {
 }
 
 func (o *Orchestrator) CancelOperation(operationId int64, status v1.OperationStatus) error {
-	o.mu.Lock()
-	for _, c := range o.cancelNotify {
-		select {
-		case c <- operationId:
-		default:
-		}
-	}
-	o.mu.Unlock()
-
 	allTasks := o.taskQueue.GetAll()
 	idx := slices.IndexFunc(allTasks, func(t stContainer) bool {
 		return t.Op != nil && t.Op.GetId() == operationId
 	})
 	if idx == -1 {
+		o.taskCancelMu.Lock()
+		if cancel, ok := o.taskCancel[operationId]; ok {
+			cancel()
+		}
+		o.taskCancelMu.Unlock()
 		return nil
 	}
 	t := allTasks[idx]
@@ -239,9 +257,15 @@ func (o *Orchestrator) CancelOperation(operationId int64, status v1.OperationSta
 	}
 	o.taskQueue.Remove(t)
 
-	if err := o.scheduleTaskHelper(t.Task, tasks.TaskPriorityDefault, t.RunAt); err != nil {
+	if st, err := o.CreateUnscheduledTask(t.Task, tasks.TaskPriorityDefault, t.RunAt); err != nil {
 		return fmt.Errorf("reschedule cancelled task: %w", err)
+	} else if !st.Eq(tasks.NeverScheduledTask) {
+		o.taskQueue.Enqueue(st.RunAt, tasks.TaskPriorityDefault, stContainer{
+			ScheduledTask: st,
+			configModno:   o.config.Modno,
+		})
 	}
+
 	return nil
 }
 
@@ -258,18 +282,34 @@ func (o *Orchestrator) cancelHelper(op *v1.Operation, status v1.OperationStatus)
 func (o *Orchestrator) Run(ctx context.Context) {
 	zap.L().Info("starting orchestrator loop")
 
-	// subscribe to cancel notifications.
-	o.mu.Lock()
-	cancelNotifyChan := make(chan int64, 10) // buffered to queue up cancel notifications.
-	o.cancelNotify = append(o.cancelNotify, cancelNotifyChan)
-	o.mu.Unlock()
+	go func() {
+		// watchdog timer to detect clock jumps and reschedule all tasks.
+		interval := 5 * time.Minute
+		grace := 30 * time.Second
+		ticker := time.NewTicker(interval)
+		lastTickTime := time.Now()
 
-	defer func() {
-		o.mu.Lock()
-		if idx := slices.Index(o.cancelNotify, cancelNotifyChan); idx != -1 {
-			o.cancelNotify = slices.Delete(o.cancelNotify, idx, idx+1)
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				deltaMs := lastTickTime.Add(interval).UnixMilli() - time.Now().UnixMilli()
+				lastTickTime = time.Now()
+				if deltaMs < 0 {
+					deltaMs = -deltaMs
+				}
+				if deltaMs < grace.Milliseconds() {
+					continue
+				}
+				zap.S().Warnf("detected a clock jump, watchdog timer is off from realtime by %dms, rescheduling all tasks", deltaMs)
+
+				if err := o.ScheduleDefaultTasks(o.config); err != nil {
+					zap.S().Errorf("failed to schedule default tasks: %v", err)
+				}
+			}
 		}
-		o.mu.Unlock()
 	}()
 
 	for {
@@ -283,33 +323,58 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			continue
 		}
 
-		taskCtx, cancelTaskCtx := context.WithCancel(ctx)
-		go func() {
-			for {
-				select {
-				case <-taskCtx.Done():
-					return
-				case opID := <-cancelNotifyChan:
-					if t.Op != nil && opID == t.Op.GetId() {
-						cancelTaskCtx()
-					}
+		// Clone the operation incase we need to reset changes and reschedule the task for a retry
+		originalOp := proto.Clone(t.Op).(*v1.Operation)
+		if t.Op != nil && t.retryCount != 0 {
+			t.Op.DisplayMessage = fmt.Sprintf("running after %d retries", t.retryCount)
+			// Delete any previous hook executions for this operation incase this is a retry.
+			prevHookExecutionIDs := []int64{}
+			if err := o.OpLog.Query(oplog.Query{FlowID: t.Op.FlowId}, func(op *v1.Operation) error {
+				if hookOp, ok := op.Op.(*v1.Operation_OperationRunHook); ok && hookOp.OperationRunHook.GetParentOp() == t.Op.Id {
+					prevHookExecutionIDs = append(prevHookExecutionIDs, op.Id)
 				}
+				return nil
+			}); err != nil {
+				zap.L().Error("failed to collect previous hook execution IDs", zap.Error(err))
 			}
-		}()
+			zap.S().Debugf("deleting previous hook execution IDs: %v", prevHookExecutionIDs)
+			if err := o.OpLog.Delete(prevHookExecutionIDs...); err != nil {
+				zap.L().Error("failed to delete previous hook execution IDs", zap.Error(err))
+			}
+		}
 
-		err := o.RunTask(taskCtx, t.ScheduledTask)
+		err := o.RunTask(ctx, t.ScheduledTask)
 
 		o.mu.Lock()
 		curCfgModno := o.config.Modno
 		o.mu.Unlock()
 		if t.configModno == curCfgModno {
 			// Only reschedule tasks if the config hasn't changed since the task was scheduled.
-			if err := o.ScheduleTask(t.Task, tasks.TaskPriorityDefault); err != nil {
-				zap.L().Error("reschedule task", zap.String("task", t.Task.Name()), zap.Error(err))
+			var retryErr *tasks.TaskRetryError
+			if errors.As(err, &retryErr) {
+				// If the task returned a retry error, schedule for a retry reusing the same task and operation data.
+				t.retryCount += 1
+				delay := retryErr.Backoff(t.retryCount)
+				if t.Op != nil {
+					t.Op = originalOp
+					t.Op.DisplayMessage = fmt.Sprintf("waiting for retry, current backoff delay: %v", delay)
+					t.Op.UnixTimeStartMs = t.RunAt.UnixMilli()
+					if err := o.OpLog.Update(t.Op); err != nil {
+						zap.S().Errorf("failed to update operation in oplog: %v", err)
+					}
+				}
+				t.RunAt = time.Now().Add(delay)
+				o.taskQueue.Enqueue(t.RunAt, tasks.TaskPriorityDefault, t)
+				zap.L().Info("retrying task",
+					zap.String("task", t.Task.Name()),
+					zap.String("runAt", t.RunAt.Format(time.RFC3339)),
+					zap.Duration("delay", delay))
+				continue // skip executing the task's callbacks.
+			} else if e := o.ScheduleTask(t.Task, tasks.TaskPriorityDefault); e != nil {
+				// Schedule the next execution of the task
+				zap.L().Error("reschedule task", zap.String("task", t.Task.Name()), zap.Error(e))
 			}
 		}
-		cancelTaskCtx()
-
 		for _, cb := range t.callbacks {
 			go cb(err)
 		}
@@ -317,15 +382,31 @@ func (o *Orchestrator) Run(ctx context.Context) {
 }
 
 func (o *Orchestrator) RunTask(ctx context.Context, st tasks.ScheduledTask) error {
-	logs := bytes.NewBuffer(nil)
-	ctx = logging.ContextWithWriter(ctx, &ioutil.SynchronizedWriter{W: logs})
-
-	runner := newTaskRunnerImpl(o, st.Task, st.Op)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	zap.L().Info("running task", zap.String("task", st.Task.Name()), zap.String("runAt", st.RunAt.Format(time.RFC3339)))
-
+	var logWriter io.WriteCloser
 	op := st.Op
 	if op != nil {
+		var err error
+		o.taskCancelMu.Lock()
+		o.taskCancel[op.Id] = cancel
+		o.taskCancelMu.Unlock()
+		defer func() {
+			o.taskCancelMu.Lock()
+			delete(o.taskCancel, op.Id)
+			o.taskCancelMu.Unlock()
+		}()
+
+		logID := uuid.New().String()
+		logWriter, err = o.logStore.Create(logID, op.Id, defaultTaskLogDuration)
+		if err != nil {
+			zap.S().Errorf("failed to create live log writer: %v", err)
+		}
+		ctx = logging.ContextWithWriter(ctx, logWriter)
+
+		op.Logref = logID
 		op.UnixTimeStartMs = time.Now().UnixMilli()
 		if op.Status == v1.OperationStatus_STATUS_PENDING || op.Status == v1.OperationStatus_STATUS_UNKNOWN {
 			op.Status = v1.OperationStatus_STATUS_INPROGRESS
@@ -339,33 +420,36 @@ func (o *Orchestrator) RunTask(ctx context.Context, st tasks.ScheduledTask) erro
 				zap.S().Errorf("failed to add operation to oplog: %w", err)
 			}
 		}
+	} else {
+		ctx = logging.ContextWithWriter(ctx, io.Discard) // discard logs if no operation.
 	}
 
 	start := time.Now()
+	runner := newTaskRunnerImpl(o, st.Task, st.Op)
 	err := st.Task.Run(ctx, st, runner)
 	if err != nil {
-		zap.L().Error("task failed", zap.String("task", st.Task.Name()), zap.Error(err), zap.Duration("duration", time.Since(start)))
-		fmt.Fprintf(logs, "\ntask %q returned error: %v\n", st.Task.Name(), err)
+		runner.Logger(ctx).Error("task failed", zap.Error(err), zap.Duration("duration", time.Since(start)))
 	} else {
-		zap.L().Info("task finished", zap.String("task", st.Task.Name()), zap.Duration("duration", time.Since(start)))
-		fmt.Fprintf(logs, "\ntask %q completed successfully\n", st.Task.Name())
+		runner.Logger(ctx).Info("task finished", zap.Duration("duration", time.Since(start)))
+		metric.GetRegistry().RecordTaskRun(st.Task.RepoID(), st.Task.PlanID(), st.Task.Type(), time.Since(start).Seconds(), "success")
+	}
+
+	// write logs to log storage for this task.
+	if logWriter != nil {
+		if err := logWriter.Close(); err != nil {
+			zap.S().Warnf("failed to close log writer for %q, logs may be partial: %v", st.Task.Name(), err)
+		}
 	}
 
 	if op != nil {
-		// write logs to log storage for this task.
-		if logs.Len() > 0 {
-			ref, err := o.logStore.Write(logs.Bytes())
-			if err != nil {
-				zap.S().Errorf("failed to write logs for task %q to log store: %v", st.Task.Name(), err)
-			} else {
-				op.Logref = ref
-			}
-		}
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, tasks.ErrTaskCancelled) {
-				// task was cancelled
+			var taskCancelledError *tasks.TaskCancelledError
+			var taskRetryError *tasks.TaskRetryError
+			if errors.As(err, &taskCancelledError) {
 				op.Status = v1.OperationStatus_STATUS_USER_CANCELLED
-			} else if err != nil {
+			} else if errors.As(err, &taskRetryError) {
+				op.Status = v1.OperationStatus_STATUS_PENDING
+			} else {
 				op.Status = v1.OperationStatus_STATUS_ERROR
 			}
 
@@ -391,39 +475,47 @@ func (o *Orchestrator) RunTask(ctx context.Context, st tasks.ScheduledTask) erro
 // ScheduleTask schedules a task to run at the next available time.
 // note that o.mu must not be held when calling this function.
 func (o *Orchestrator) ScheduleTask(t tasks.Task, priority int, callbacks ...func(error)) error {
-	return o.scheduleTaskHelper(t, priority, o.curTime(), callbacks...)
-}
-
-func (o *Orchestrator) scheduleTaskHelper(t tasks.Task, priority int, curTime time.Time, callbacks ...func(error)) error {
-	nextRun, err := t.Next(curTime, newTaskRunnerImpl(o, t, nil))
+	nextRun, err := o.CreateUnscheduledTask(t, priority, o.curTime())
 	if err != nil {
-		return fmt.Errorf("finding run time for task %q: %w", t.Name(), err)
+		return err
 	}
 	if nextRun.Eq(tasks.NeverScheduledTask) {
 		return nil
 	}
-	nextRun.Task = t
+
 	stc := stContainer{
 		ScheduledTask: nextRun,
 		configModno:   o.config.Modno,
 		callbacks:     callbacks,
 	}
 
-	if stc.Op != nil {
-		stc.Op.InstanceId = o.config.Instance
-		stc.Op.PlanId = t.PlanID()
-		stc.Op.RepoId = t.RepoID()
-		stc.Op.Status = v1.OperationStatus_STATUS_PENDING
-		stc.Op.UnixTimeStartMs = nextRun.RunAt.UnixMilli()
-
-		if err := o.OpLog.Add(nextRun.Op); err != nil {
-			return fmt.Errorf("add operation to oplog: %w", err)
-		}
-	}
-
 	o.taskQueue.Enqueue(nextRun.RunAt, priority, stc)
 	zap.L().Info("scheduled task", zap.String("task", t.Name()), zap.String("runAt", nextRun.RunAt.Format(time.RFC3339)))
 	return nil
+}
+
+func (o *Orchestrator) CreateUnscheduledTask(t tasks.Task, priority int, curTime time.Time) (tasks.ScheduledTask, error) {
+	nextRun, err := t.Next(curTime, newTaskRunnerImpl(o, t, nil))
+	if err != nil {
+		return tasks.NeverScheduledTask, fmt.Errorf("finding run time for task %q: %w", t.Name(), err)
+	}
+	if nextRun.Eq(tasks.NeverScheduledTask) {
+		return tasks.NeverScheduledTask, nil
+	}
+	nextRun.Task = t
+
+	if nextRun.Op != nil {
+		nextRun.Op.InstanceId = o.config.Instance
+		nextRun.Op.PlanId = t.PlanID()
+		nextRun.Op.RepoId = t.RepoID()
+		nextRun.Op.Status = v1.OperationStatus_STATUS_PENDING
+		nextRun.Op.UnixTimeStartMs = nextRun.RunAt.UnixMilli()
+
+		if err := o.OpLog.Add(nextRun.Op); err != nil {
+			return tasks.NeverScheduledTask, fmt.Errorf("add operation to oplog: %w", err)
+		}
+	}
+	return nextRun, nil
 }
 
 func (o *Orchestrator) Config() *v1.Config {
@@ -456,17 +548,15 @@ func (rp *resticRepoPool) GetRepo(repoId string) (*repo.RepoOrchestrator, error)
 		return nil, ErrRepoNotFound
 	}
 
-	var repoProto *v1.Repo
-	for _, r := range rp.config.Repos {
-		if r.GetId() == repoId {
-			repoProto = r
-		}
-	}
-
 	// Check if we already have a repo for this id, if we do return it.
 	r, ok := rp.repos[repoId]
 	if ok {
 		return r, nil
+	}
+
+	repoProto := config.FindRepo(rp.config, repoId)
+	if repoProto == nil {
+		return nil, ErrRepoNotFound
 	}
 
 	// Otherwise create a new repo.

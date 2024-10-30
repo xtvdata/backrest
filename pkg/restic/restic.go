@@ -21,6 +21,7 @@ import (
 var errAlreadyInitialized = errors.New("repo already initialized")
 var ErrPartialBackup = errors.New("incomplete backup")
 var ErrBackupFailed = errors.New("backup failed")
+var ErrRestoreFailed = errors.New("restore failed")
 
 type Repo struct {
 	cmd string
@@ -218,7 +219,7 @@ func (r *Repo) Restore(ctx context.Context, snapshot string, callback func(*Rest
 				if exitErr.ExitCode() == 3 {
 					cmdErr = ErrPartialBackup
 				} else {
-					cmdErr = fmt.Errorf("exit code %d: %w", exitErr.ExitCode(), ErrBackupFailed)
+					cmdErr = fmt.Errorf("exit code %d: %w", exitErr.ExitCode(), ErrRestoreFailed)
 				}
 			}
 		}
@@ -234,7 +235,7 @@ func (r *Repo) Snapshots(ctx context.Context, opts ...GenericOption) ([]*Snapsho
 	r.pipeCmdOutputToWriter(cmd, output)
 
 	if err := cmd.Run(); err != nil {
-		return nil, newCmdError(ctx, cmd, err)
+		return nil, newCmdError(ctx, cmd, newErrorWithOutput(err, output.String()))
 	}
 
 	var snapshots []*Snapshot
@@ -258,7 +259,7 @@ func (r *Repo) Forget(ctx context.Context, policy *RetentionPolicy, opts ...Gene
 	output := bytes.NewBuffer(nil)
 	r.pipeCmdOutputToWriter(cmd, output)
 	if err := cmd.Run(); err != nil {
-		return nil, newCmdError(ctx, cmd, err)
+		return nil, newCmdError(ctx, cmd, newErrorWithOutput(err, output.String()))
 	}
 
 	var result []ForgetResult
@@ -324,7 +325,7 @@ func (r *Repo) ListDirectory(ctx context.Context, snapshot string, path string, 
 	r.pipeCmdOutputToWriter(cmd, output)
 
 	if err := cmd.Run(); err != nil {
-		return nil, nil, newCmdError(ctx, cmd, err)
+		return nil, nil, newCmdError(ctx, cmd, newErrorWithOutput(err, output.String()))
 	}
 
 	snapshots, entries, err := readLs(output)

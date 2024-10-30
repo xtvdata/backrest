@@ -7,7 +7,6 @@ import (
 
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/internal/oplog"
-	"github.com/garethgeorge/backrest/internal/oplog/indexutil"
 )
 
 type StatsTask struct {
@@ -19,6 +18,7 @@ type StatsTask struct {
 func NewStatsTask(repoID, planID string, force bool) Task {
 	return &StatsTask{
 		BaseTask: BaseTask{
+			TaskType:   "stats",
 			TaskName:   fmt.Sprintf("stats for repo %q", repoID),
 			TaskRepoID: repoID,
 			TaskPlanID: planID,
@@ -42,21 +42,24 @@ func (t *StatsTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error
 		}, nil
 	}
 
-	// TODO: make the "stats" schedule configurable.
+	// check last stats time
 	var lastRan time.Time
-	if err := runner.OpLog().ForEach(oplog.Query{RepoId: t.RepoID()}, indexutil.Reversed(indexutil.CollectAll()), func(op *v1.Operation) error {
-		if _, ok := op.Op.(*v1.Operation_OperationStats); ok {
+	if err := runner.OpLog().Query(oplog.Query{RepoID: t.RepoID(), Reversed: true}, func(op *v1.Operation) error {
+		if op.Status == v1.OperationStatus_STATUS_PENDING || op.Status == v1.OperationStatus_STATUS_SYSTEM_CANCELLED {
+			return nil
+		}
+		if _, ok := op.Op.(*v1.Operation_OperationStats); ok && op.UnixTimeEndMs != 0 {
 			lastRan = time.Unix(0, op.UnixTimeEndMs*int64(time.Millisecond))
 			return oplog.ErrStopIteration
 		}
 		return nil
 	}); err != nil {
-		return NeverScheduledTask, fmt.Errorf("finding last backup run time: %w", err)
+		return NeverScheduledTask, fmt.Errorf("finding last check run time: %w", err)
 	}
 
-	// Runs every 30 days
-	if now.Sub(lastRan) < 30*24*time.Hour {
-		return ScheduledTask{}, nil
+	// Runs at most once per day.
+	if time.Since(lastRan) < 24*time.Hour {
+		return NeverScheduledTask, nil
 	}
 	return ScheduledTask{
 		Task:  t,

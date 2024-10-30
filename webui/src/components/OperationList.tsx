@@ -1,72 +1,48 @@
 import React, { useEffect, useState } from "react";
-import {
-  Operation,
-  OperationEvent,
-  OperationEventType,
-} from "../../gen/ts/v1/operations_pb";
+import { Operation } from "../../gen/ts/v1/operations_pb";
 import { Empty, List } from "antd";
-import {
-  BackupInfo,
-  BackupInfoCollector,
-  getOperations,
-  matchSelector,
-  shouldHideStatus,
-  subscribeToOperations,
-  unsubscribeFromOperations,
-} from "../state/oplog";
 import _ from "lodash";
 import { GetOperationsRequest } from "../../gen/ts/v1/service_pb";
 import { useAlertApi } from "./Alerts";
 import { OperationRow } from "./OperationRow";
+import { OplogState, syncStateFromRequest } from "../state/logstate";
+import { shouldHideStatus } from "../state/oplog";
 
 // OperationList displays a list of operations that are either fetched based on 'req' or passed in via 'useBackups'.
 // If showPlan is provided the planId will be displayed next to each operation in the operation list.
 export const OperationList = ({
   req,
-  useBackups,
   useOperations,
   showPlan,
+  displayHooksInline,
+  filter,
 }: React.PropsWithoutRef<{
   req?: GetOperationsRequest;
-  useBackups?: BackupInfo[]; // a backup to display; some operations will be filtered out e.g. hook executions.
   useOperations?: Operation[]; // exact set of operations to display; no filtering will be applied.
   showPlan?: boolean;
+  displayHooksInline?: boolean;
+  filter?: (op: Operation) => boolean;
 }>) => {
   const alertApi = useAlertApi();
 
-  let backups: BackupInfo[] = [];
+  let [operations, setOperations] = useState<Operation[]>([]);
+
   if (req) {
-    const [backupState, setBackups] = useState<BackupInfo[]>(useBackups || []);
-    backups = backupState;
-
-    // track backups for this operation tree view.
     useEffect(() => {
-      const backupCollector = new BackupInfoCollector(
-        (op) => !shouldHideStatus(op.status)
-      );
-      backupCollector.subscribe(
-        _.debounce(
-          () => {
-            let backups = backupCollector.getAll();
-            backups.sort((a, b) => {
-              return b.startTimeMs - a.startTimeMs;
-            });
-            setBackups(backups);
-          },
-          100,
-          { leading: true, trailing: true }
-        )
+      const logState = new OplogState(
+        (op) => !shouldHideStatus(op.status) && (!filter || filter(op))
       );
 
-      return backupCollector.collectFromRequest(req, (err) => {
-        alertApi!.error("API error: " + err.message);
+      logState.subscribe((ids, flowIDs, event) => {
+        setOperations(logState.getAll());
+      });
+
+      return syncStateFromRequest(logState, req, (e) => {
+        alertApi!.error("Failed to fetch operations: " + e.message);
       });
     }, [JSON.stringify(req)]);
-  } else {
-    backups = [...(useBackups || [])];
   }
-
-  if (backups.length === 0 && !useOperations) {
+  if (!operations) {
     return (
       <Empty
         description="No operations yet."
@@ -76,32 +52,33 @@ export const OperationList = ({
   }
 
   const hookExecutionsForOperation: Map<BigInt, Operation[]> = new Map();
-  let operations: Operation[] = [];
+  let operationsForDisplay: Operation[] = [];
   if (useOperations) {
-    operations = useOperations;
-  } else {
-    operations = backups
-      .flatMap((b) => b.operations)
-      .filter((op) => {
-        if (op.op.case === "operationRunHook") {
-          const parentOp = op.op.value.parentOp;
-          if (!hookExecutionsForOperation.has(parentOp)) {
-            hookExecutionsForOperation.set(parentOp, []);
-          }
-          hookExecutionsForOperation.get(parentOp)!.push(op);
-          return false;
-        }
-        return true;
-      });
+    operations = [...useOperations];
   }
-  operations.sort((a, b) => {
+  if (!displayHooksInline) {
+    operationsForDisplay = operations.filter((op) => {
+      if (op.op.case === "operationRunHook") {
+        const parentOp = op.op.value.parentOp;
+        if (!hookExecutionsForOperation.has(parentOp)) {
+          hookExecutionsForOperation.set(parentOp, []);
+        }
+        hookExecutionsForOperation.get(parentOp)!.push(op);
+        return false;
+      }
+      return true;
+    });
+  } else {
+    operationsForDisplay = operations;
+  }
+  operationsForDisplay.sort((a, b) => {
     return Number(b.unixTimeStartMs - a.unixTimeStartMs);
   });
   return (
     <List
       itemLayout="horizontal"
       size="small"
-      dataSource={operations}
+      dataSource={operationsForDisplay}
       renderItem={(op) => {
         return (
           <OperationRow
@@ -114,7 +91,7 @@ export const OperationList = ({
         );
       }}
       pagination={
-        operations.length > 25
+        operationsForDisplay.length > 25
           ? { position: "both", align: "center", defaultPageSize: 25 }
           : undefined
       }

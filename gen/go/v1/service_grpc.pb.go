@@ -21,23 +21,24 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	Backrest_GetConfig_FullMethodName          = "/v1.Backrest/GetConfig"
-	Backrest_SetConfig_FullMethodName          = "/v1.Backrest/SetConfig"
-	Backrest_AddRepo_FullMethodName            = "/v1.Backrest/AddRepo"
-	Backrest_GetOperationEvents_FullMethodName = "/v1.Backrest/GetOperationEvents"
-	Backrest_GetOperations_FullMethodName      = "/v1.Backrest/GetOperations"
-	Backrest_ListSnapshots_FullMethodName      = "/v1.Backrest/ListSnapshots"
-	Backrest_ListSnapshotFiles_FullMethodName  = "/v1.Backrest/ListSnapshotFiles"
-	Backrest_Backup_FullMethodName             = "/v1.Backrest/Backup"
-	Backrest_DoRepoTask_FullMethodName         = "/v1.Backrest/DoRepoTask"
-	Backrest_Forget_FullMethodName             = "/v1.Backrest/Forget"
-	Backrest_Restore_FullMethodName            = "/v1.Backrest/Restore"
-	Backrest_Cancel_FullMethodName             = "/v1.Backrest/Cancel"
-	Backrest_GetLogs_FullMethodName            = "/v1.Backrest/GetLogs"
-	Backrest_RunCommand_FullMethodName         = "/v1.Backrest/RunCommand"
-	Backrest_GetDownloadURL_FullMethodName     = "/v1.Backrest/GetDownloadURL"
-	Backrest_ClearHistory_FullMethodName       = "/v1.Backrest/ClearHistory"
-	Backrest_PathAutocomplete_FullMethodName   = "/v1.Backrest/PathAutocomplete"
+	Backrest_GetConfig_FullMethodName           = "/v1.Backrest/GetConfig"
+	Backrest_SetConfig_FullMethodName           = "/v1.Backrest/SetConfig"
+	Backrest_AddRepo_FullMethodName             = "/v1.Backrest/AddRepo"
+	Backrest_GetOperationEvents_FullMethodName  = "/v1.Backrest/GetOperationEvents"
+	Backrest_GetOperations_FullMethodName       = "/v1.Backrest/GetOperations"
+	Backrest_ListSnapshots_FullMethodName       = "/v1.Backrest/ListSnapshots"
+	Backrest_ListSnapshotFiles_FullMethodName   = "/v1.Backrest/ListSnapshotFiles"
+	Backrest_Backup_FullMethodName              = "/v1.Backrest/Backup"
+	Backrest_DoRepoTask_FullMethodName          = "/v1.Backrest/DoRepoTask"
+	Backrest_Forget_FullMethodName              = "/v1.Backrest/Forget"
+	Backrest_Restore_FullMethodName             = "/v1.Backrest/Restore"
+	Backrest_Cancel_FullMethodName              = "/v1.Backrest/Cancel"
+	Backrest_GetLogs_FullMethodName             = "/v1.Backrest/GetLogs"
+	Backrest_RunCommand_FullMethodName          = "/v1.Backrest/RunCommand"
+	Backrest_GetDownloadURL_FullMethodName      = "/v1.Backrest/GetDownloadURL"
+	Backrest_ClearHistory_FullMethodName        = "/v1.Backrest/ClearHistory"
+	Backrest_PathAutocomplete_FullMethodName    = "/v1.Backrest/PathAutocomplete"
+	Backrest_GetSummaryDashboard_FullMethodName = "/v1.Backrest/GetSummaryDashboard"
 )
 
 // BackrestClient is the client API for Backrest service.
@@ -62,15 +63,17 @@ type BackrestClient interface {
 	// Cancel attempts to cancel a task with the given operation ID. Not guaranteed to succeed.
 	Cancel(ctx context.Context, in *types.Int64Value, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// GetLogs returns the keyed large data for the given operation.
-	GetLogs(ctx context.Context, in *LogDataRequest, opts ...grpc.CallOption) (*types.BytesValue, error)
+	GetLogs(ctx context.Context, in *LogDataRequest, opts ...grpc.CallOption) (Backrest_GetLogsClient, error)
 	// RunCommand executes a generic restic command on the repository.
-	RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (Backrest_RunCommandClient, error)
+	RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (*types.Int64Value, error)
 	// GetDownloadURL returns a signed download URL given a forget operation ID.
 	GetDownloadURL(ctx context.Context, in *types.Int64Value, opts ...grpc.CallOption) (*types.StringValue, error)
 	// Clears the history of operations
 	ClearHistory(ctx context.Context, in *ClearHistoryRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// PathAutocomplete provides path autocompletion options for a given filesystem path.
 	PathAutocomplete(ctx context.Context, in *types.StringValue, opts ...grpc.CallOption) (*types.StringList, error)
+	// GetSummaryDashboard returns data for the dashboard view.
+	GetSummaryDashboard(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SummaryDashboardResponse, error)
 }
 
 type backrestClient struct {
@@ -212,21 +215,12 @@ func (c *backrestClient) Cancel(ctx context.Context, in *types.Int64Value, opts 
 	return out, nil
 }
 
-func (c *backrestClient) GetLogs(ctx context.Context, in *LogDataRequest, opts ...grpc.CallOption) (*types.BytesValue, error) {
-	out := new(types.BytesValue)
-	err := c.cc.Invoke(ctx, Backrest_GetLogs_FullMethodName, in, out, opts...)
+func (c *backrestClient) GetLogs(ctx context.Context, in *LogDataRequest, opts ...grpc.CallOption) (Backrest_GetLogsClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Backrest_ServiceDesc.Streams[1], Backrest_GetLogs_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
-}
-
-func (c *backrestClient) RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (Backrest_RunCommandClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Backrest_ServiceDesc.Streams[1], Backrest_RunCommand_FullMethodName, opts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &backrestRunCommandClient{stream}
+	x := &backrestGetLogsClient{stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -236,21 +230,30 @@ func (c *backrestClient) RunCommand(ctx context.Context, in *RunCommandRequest, 
 	return x, nil
 }
 
-type Backrest_RunCommandClient interface {
+type Backrest_GetLogsClient interface {
 	Recv() (*types.BytesValue, error)
 	grpc.ClientStream
 }
 
-type backrestRunCommandClient struct {
+type backrestGetLogsClient struct {
 	grpc.ClientStream
 }
 
-func (x *backrestRunCommandClient) Recv() (*types.BytesValue, error) {
+func (x *backrestGetLogsClient) Recv() (*types.BytesValue, error) {
 	m := new(types.BytesValue)
 	if err := x.ClientStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+func (c *backrestClient) RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (*types.Int64Value, error) {
+	out := new(types.Int64Value)
+	err := c.cc.Invoke(ctx, Backrest_RunCommand_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *backrestClient) GetDownloadURL(ctx context.Context, in *types.Int64Value, opts ...grpc.CallOption) (*types.StringValue, error) {
@@ -280,6 +283,15 @@ func (c *backrestClient) PathAutocomplete(ctx context.Context, in *types.StringV
 	return out, nil
 }
 
+func (c *backrestClient) GetSummaryDashboard(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*SummaryDashboardResponse, error) {
+	out := new(SummaryDashboardResponse)
+	err := c.cc.Invoke(ctx, Backrest_GetSummaryDashboard_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // BackrestServer is the server API for Backrest service.
 // All implementations must embed UnimplementedBackrestServer
 // for forward compatibility
@@ -302,15 +314,17 @@ type BackrestServer interface {
 	// Cancel attempts to cancel a task with the given operation ID. Not guaranteed to succeed.
 	Cancel(context.Context, *types.Int64Value) (*emptypb.Empty, error)
 	// GetLogs returns the keyed large data for the given operation.
-	GetLogs(context.Context, *LogDataRequest) (*types.BytesValue, error)
+	GetLogs(*LogDataRequest, Backrest_GetLogsServer) error
 	// RunCommand executes a generic restic command on the repository.
-	RunCommand(*RunCommandRequest, Backrest_RunCommandServer) error
+	RunCommand(context.Context, *RunCommandRequest) (*types.Int64Value, error)
 	// GetDownloadURL returns a signed download URL given a forget operation ID.
 	GetDownloadURL(context.Context, *types.Int64Value) (*types.StringValue, error)
 	// Clears the history of operations
 	ClearHistory(context.Context, *ClearHistoryRequest) (*emptypb.Empty, error)
 	// PathAutocomplete provides path autocompletion options for a given filesystem path.
 	PathAutocomplete(context.Context, *types.StringValue) (*types.StringList, error)
+	// GetSummaryDashboard returns data for the dashboard view.
+	GetSummaryDashboard(context.Context, *emptypb.Empty) (*SummaryDashboardResponse, error)
 	mustEmbedUnimplementedBackrestServer()
 }
 
@@ -354,11 +368,11 @@ func (UnimplementedBackrestServer) Restore(context.Context, *RestoreSnapshotRequ
 func (UnimplementedBackrestServer) Cancel(context.Context, *types.Int64Value) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Cancel not implemented")
 }
-func (UnimplementedBackrestServer) GetLogs(context.Context, *LogDataRequest) (*types.BytesValue, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
+func (UnimplementedBackrestServer) GetLogs(*LogDataRequest, Backrest_GetLogsServer) error {
+	return status.Errorf(codes.Unimplemented, "method GetLogs not implemented")
 }
-func (UnimplementedBackrestServer) RunCommand(*RunCommandRequest, Backrest_RunCommandServer) error {
-	return status.Errorf(codes.Unimplemented, "method RunCommand not implemented")
+func (UnimplementedBackrestServer) RunCommand(context.Context, *RunCommandRequest) (*types.Int64Value, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunCommand not implemented")
 }
 func (UnimplementedBackrestServer) GetDownloadURL(context.Context, *types.Int64Value) (*types.StringValue, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetDownloadURL not implemented")
@@ -368,6 +382,9 @@ func (UnimplementedBackrestServer) ClearHistory(context.Context, *ClearHistoryRe
 }
 func (UnimplementedBackrestServer) PathAutocomplete(context.Context, *types.StringValue) (*types.StringList, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method PathAutocomplete not implemented")
+}
+func (UnimplementedBackrestServer) GetSummaryDashboard(context.Context, *emptypb.Empty) (*SummaryDashboardResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSummaryDashboard not implemented")
 }
 func (UnimplementedBackrestServer) mustEmbedUnimplementedBackrestServer() {}
 
@@ -601,43 +618,43 @@ func _Backrest_Cancel_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Backrest_GetLogs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LogDataRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(BackrestServer).GetLogs(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Backrest_GetLogs_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BackrestServer).GetLogs(ctx, req.(*LogDataRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Backrest_RunCommand_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(RunCommandRequest)
+func _Backrest_GetLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(LogDataRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(BackrestServer).RunCommand(m, &backrestRunCommandServer{stream})
+	return srv.(BackrestServer).GetLogs(m, &backrestGetLogsServer{stream})
 }
 
-type Backrest_RunCommandServer interface {
+type Backrest_GetLogsServer interface {
 	Send(*types.BytesValue) error
 	grpc.ServerStream
 }
 
-type backrestRunCommandServer struct {
+type backrestGetLogsServer struct {
 	grpc.ServerStream
 }
 
-func (x *backrestRunCommandServer) Send(m *types.BytesValue) error {
+func (x *backrestGetLogsServer) Send(m *types.BytesValue) error {
 	return x.ServerStream.SendMsg(m)
+}
+
+func _Backrest_RunCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunCommandRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BackrestServer).RunCommand(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Backrest_RunCommand_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BackrestServer).RunCommand(ctx, req.(*RunCommandRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _Backrest_GetDownloadURL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -694,6 +711,24 @@ func _Backrest_PathAutocomplete_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Backrest_GetSummaryDashboard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BackrestServer).GetSummaryDashboard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Backrest_GetSummaryDashboard_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BackrestServer).GetSummaryDashboard(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Backrest_ServiceDesc is the grpc.ServiceDesc for Backrest service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -746,8 +781,8 @@ var Backrest_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Backrest_Cancel_Handler,
 		},
 		{
-			MethodName: "GetLogs",
-			Handler:    _Backrest_GetLogs_Handler,
+			MethodName: "RunCommand",
+			Handler:    _Backrest_RunCommand_Handler,
 		},
 		{
 			MethodName: "GetDownloadURL",
@@ -761,6 +796,10 @@ var Backrest_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "PathAutocomplete",
 			Handler:    _Backrest_PathAutocomplete_Handler,
 		},
+		{
+			MethodName: "GetSummaryDashboard",
+			Handler:    _Backrest_GetSummaryDashboard_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -769,8 +808,8 @@ var Backrest_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 		{
-			StreamName:    "RunCommand",
-			Handler:       _Backrest_RunCommand_Handler,
+			StreamName:    "GetLogs",
+			Handler:       _Backrest_GetLogs_Handler,
 			ServerStreams: true,
 		},
 	},

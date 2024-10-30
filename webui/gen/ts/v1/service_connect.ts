@@ -6,7 +6,7 @@
 import { Empty, MethodKind } from "@bufbuild/protobuf";
 import { Config, Repo } from "./config_pb.js";
 import { OperationEvent, OperationList } from "./operations_pb.js";
-import { ClearHistoryRequest, DoRepoTaskRequest, ForgetRequest, GetOperationsRequest, ListSnapshotFilesRequest, ListSnapshotFilesResponse, ListSnapshotsRequest, LogDataRequest, RestoreSnapshotRequest, RunCommandRequest } from "./service_pb.js";
+import { ClearHistoryRequest, DoRepoTaskRequest, ForgetRequest, GetOperationsRequest, ListSnapshotFilesRequest, ListSnapshotFilesResponse, ListSnapshotsRequest, LogDataRequest, RestoreSnapshotRequest, RunCommandRequest, SummaryDashboardResponse } from "./service_pb.js";
 import { ResticSnapshotList } from "./restic_pb.js";
 import { BytesValue, Int64Value, StringList, StringValue } from "../types/value_pb.js";
 
@@ -143,7 +143,7 @@ export const Backrest = {
       name: "GetLogs",
       I: LogDataRequest,
       O: BytesValue,
-      kind: MethodKind.Unary,
+      kind: MethodKind.ServerStreaming,
     },
     /**
      * RunCommand executes a generic restic command on the repository.
@@ -153,8 +153,8 @@ export const Backrest = {
     runCommand: {
       name: "RunCommand",
       I: RunCommandRequest,
-      O: BytesValue,
-      kind: MethodKind.ServerStreaming,
+      O: Int64Value,
+      kind: MethodKind.Unary,
     },
     /**
      * GetDownloadURL returns a signed download URL given a forget operation ID.
@@ -187,6 +187,17 @@ export const Backrest = {
       name: "PathAutocomplete",
       I: StringValue,
       O: StringList,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * GetSummaryDashboard returns data for the dashboard view.
+     *
+     * @generated from rpc v1.Backrest.GetSummaryDashboard
+     */
+    getSummaryDashboard: {
+      name: "GetSummaryDashboard",
+      I: Empty,
+      O: SummaryDashboardResponse,
       kind: MethodKind.Unary,
     },
   }
