@@ -14,7 +14,7 @@ Backrest is a web-accessible backup solution built on top of [restic](https://re
 
 By building on restic, Backrest leverages restic's mature feature set. Restic provides fast, reliable, and secure backup operations.
 
-Backrest itself is built in Golang (matching restic's implementation) and is shipped as a self-contained and light weight binary with no dependecies other than restic. This project aims to be the easiest way to setup and get started with backups on any system. You can expect to be able to perform all operations from the web interface but should you ever need more control, you are free to browse your repo and perform operations using the [restic cli](https://restic.readthedocs.io/en/latest/manual_rest.html). Additionally, Backrest can safely detect and import your existing snapshots (or externally created snapshots on an ongoing basis).
+Backrest itself is built in Golang (matching restic's implementation) and is shipped as a self-contained and light weight binary with no dependencies other than restic. This project aims to be the easiest way to setup and get started with backups on any system. You can expect to be able to perform all operations from the web interface but should you ever need more control, you are free to browse your repo and perform operations using the [restic cli](https://restic.readthedocs.io/en/latest/manual_rest.html). Additionally, Backrest can safely detect and import your existing snapshots (or externally created snapshots on an ongoing basis).
 
 **Preview**
 
@@ -37,8 +37,8 @@ Backrest itself is built in Golang (matching restic's implementation) and is shi
 - Multi-platform support (Linux, macOS, Windows, FreeBSD, [Docker](https://hub.docker.com/r/garethgeorge/backrest))
 - Import your existing restic repositories
 - Cron scheduled backups and health operations (e.g. prune, check, forget)
-- UI for browing and restoring files from snapshots
-- Configurable backup notifications (e.g. Discord, Slack, Shoutrrr, Gotify)
+- UI for browsing and restoring files from snapshots
+- Configurable backup notifications (e.g. Discord, Slack, Shoutrrr, Gotify, Healthchecks)
 - Add shell command hooks to run before and after backup operations.
 - Compatible with rclone remotes
 - Backup to any restic supported storage (e.g. S3, B2, Azure, GCS, local, SFTP, and all [rclone remotes](https://rclone.org/))
@@ -57,12 +57,12 @@ Download options
 
 - Download and run a release from the [releases page](https://github.com/garethgeorge/backrest/releases).
 - Build from source ([see below](#building)).
-- Run with docker: `garethgeorge/backrest:latest` ([see on dockerhub](https://hub.docker.com/r/garethgeorge/backrest)) or `garethgeorge/backrest:latest-alpine` for an image that includes rclone and common unix utilities.
+- Run with docker: `garethgeorge/backrest:latest` ([see on dockerhub](https://hub.docker.com/r/garethgeorge/backrest)) for an image that includes rclone and common unix utilities or `garethgeorge/backrest:scratch` for a minimal image.
 
 Backrest is accessible from a web browser. By default it binds to `127.0.0.1:9898` and can be accessed at `http://localhost:9898`. Change the port with the `BACKREST_PORT` environment variable e.g. `BACKREST_PORT=0.0.0.0:9898 backrest` to listen on all network interfaces. On first startup backrest will prompt you to create a default username and password, this can be changed later in the settings page.
 
 > [!Note]
-> Backrest installs a specific restic version to ensure that the restic dependency matches backrest. This provides the best guarantees for stability. If you wish to use a different version of restic OR if you would prefer to install restic manually you may do so by setting the `BACKREST_RESTIC_COMMAND` environment variable to the path of the restic binary you wish to use.
+> Backrest installs a specific restic version to ensure that it is compatible. If you wish to use a different version of restic OR if you would prefer to install restic manually, use the `BACKREST_RESTIC_COMMAND` environment variable to specify the path of your restic install.
 
 ## Running with Docker Compose
 
@@ -74,7 +74,7 @@ Example compose file:
 version: "3.2"
 services:
   backrest:
-    image: garethgeorge/backrest
+    image: garethgeorge/backrest:latest
     container_name: backrest
     hostname: backrest
     volumes:
@@ -253,3 +253,45 @@ To run the binary on login, create a shortcut to the binary and place it in the 
 | `BACKREST_DATA`           | Path to the data directory  | `%appdata%\backrest\data`                                                                  |
 | `BACKREST_RESTIC_COMMAND` | Path to restic binary       | Defaults to a Backrest managed version of restic in `C:\Program Files\restic\restic-x.x.x` |
 | `XDG_CACHE_HOME`          | Path to the cache directory |                                                                                            |
+
+# Contributing
+
+Contributions are welcome! See the [issues](https://github.com/garethgeorge/backrest/issues) or feel free to open a new issue to discuss a project. Beyond the core codebase, contributions to [documentation](https://garethgeorge.github.io/backrest/introduction/getting-started), [cookbooks](https://garethgeorge.github.io/backrest/cookbooks/command-hook-examples), and testing are always welcome.
+
+## Build Depedencies
+
+- [Node.js](https://nodejs.org/en) for UI development
+- [Go](https://go.dev/) 1.21 or greater for server development
+- [goreleaser](https://github.com/goreleaser/goreleaser) `go install github.com/goreleaser/goreleaser@latest`
+
+**(Optional) To Edit Protobuffers**
+
+```sh
+apt install -y protobuf-compiler
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+go install github.com/bufbuild/buf/cmd/buf@v1.27.2
+go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install connectrpc.com/connect/cmd/protoc-gen-connect-go@latest
+npm install -g @bufbuild/protoc-gen-es @connectrpc/protoc-gen-connect-es
+```
+
+## Compiling
+
+```sh
+(cd webui && npm i && npm run build)
+(cd cmd/backrest && go build .)
+```
+
+## Using VSCode Dev Containers
+
+You can also use VSCode with [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension to quickly get up and running with a working development and debugging environment.
+
+0. Make sure Docker and VSCode with [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension is installed
+1. Clone this repository
+2. Open this folder in VSCode
+3. When prompted, click on `Open in Container` button, or run `> Dev Containers: Rebuild and Reopen in Containers` command
+4. When container is started, go to `Run and Debug`, choose `Debug Backrest (backend+frontend)` and run it
+
+> [!NOTE]
+> Provided launch configuration has hot reload for typescript frontend.

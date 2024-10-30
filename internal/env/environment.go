@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -31,7 +32,7 @@ func ConfigFilePath() string {
 	if val := os.Getenv(EnvVarConfigPath); val != "" {
 		return val
 	}
-	return path.Join(getConfigDir(), "backrest/config.json")
+	return filepath.Join(getConfigDir(), "backrest", "config.json")
 }
 
 // DataDir
@@ -49,7 +50,7 @@ func DataDir() string {
 	}
 
 	if runtime.GOOS == "windows" {
-		return path.Join(getConfigDir(), "backrest/data")
+		return filepath.Join(getConfigDir(), "backrest", "data")
 	}
 	return path.Join(getHomeDir(), ".local/share/backrest")
 }
@@ -74,6 +75,11 @@ func ResticBinPath() string {
 	return ""
 }
 
+func LogsPath() string {
+	dataDir := DataDir()
+	return filepath.Join(dataDir, "processlogs")
+}
+
 func getHomeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -93,7 +99,7 @@ func getConfigDir() string {
 	if val := os.Getenv("XDG_CONFIG_HOME"); val != "" {
 		return val
 	}
-	return path.Join(getHomeDir(), ".config")
+	return filepath.Join(getHomeDir(), ".config")
 }
 
 func formatBindAddress(addr string) string {

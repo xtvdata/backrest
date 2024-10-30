@@ -37,7 +37,11 @@ import {
 import { ConfirmButton } from "../components/SpinButton";
 import { useConfig } from "../components/ConfigProvider";
 import Cron from "react-js-cron";
-import { ScheduleFormItem } from "../components/ScheduleFormItem";
+import {
+  ScheduleDefaultsDaily,
+  ScheduleDefaultsInfrequent,
+  ScheduleFormItem,
+} from "../components/ScheduleFormItem";
 import { proto3 } from "@bufbuild/protobuf";
 import { isWindows } from "../state/buildcfg";
 
@@ -106,26 +110,29 @@ export const AddRepoModal = ({ template }: { template: Repo | null }) => {
       });
 
       if (template !== null) {
-        const configCopy = config.clone();
-        // We are in the edit repo flow, update the repo in the config
-        const idx = configCopy.repos!.findIndex((r) => r.id === template!.id);
-        if (idx === -1) {
-          alertsApi.error("Can't update repo, not found");
-          return;
-        }
-        configCopy.repos![idx] = repo;
-        setConfig(await backrestService.setConfig(configCopy));
+        // We are in the update repo flow, update the repo via the service
+        setConfig(await backrestService.addRepo(repo));
         showModal(null);
-        alertsApi.success("Updated repo " + repo.uri);
-
-        // Update the snapshots for the repo to confirm the config works.
-        // TODO: this operation is only used here, find a different RPC for this purpose.
-        await backrestService.listSnapshots({ repoId: repo.id });
+        alertsApi.success("Updated repo configuration " + repo.uri);
       } else {
         // We are in the create repo flow, create the new repo via the service
         setConfig(await backrestService.addRepo(repo));
         showModal(null);
         alertsApi.success("Added repo " + repo.uri);
+      }
+
+      try {
+        // Update the snapshots for the repo to confirm the config works.
+        // TODO: this operation is only used here, find a different RPC for this purpose.
+        await backrestService.listSnapshots({ repoId: repo.id });
+      } catch (e: any) {
+        alertsApi.error(
+          formatErrorAlert(
+            e,
+            "Failed to list snapshots for updated/added repo: "
+          ),
+          10
+        );
       }
     } catch (e: any) {
       alertsApi.error(formatErrorAlert(e, "Operation error: "), 10);
@@ -462,18 +469,21 @@ export const AddRepoModal = ({ template }: { template: Repo | null }) => {
           >
             <Form.Item
               name={["prunePolicy", "maxUnusedPercent"]}
-              initialValue={25}
+              initialValue={10}
               required={false}
             >
-              <InputNumber
+              <InputPercent
                 addonBefore={
                   <Tooltip title="The maximum percentage of the repo size that may be unused after a prune operation completes. High values reduce copying at the expense of storage.">
-                    <div style={{ width: "12" }}>Max Unused % After Prune</div>
+                    <div style={{ width: "12" }}>Max Unused After Prune</div>
                   </Tooltip>
                 }
               />
             </Form.Item>
-            <ScheduleFormItem name={["prunePolicy", "schedule"]} />
+            <ScheduleFormItem
+              name={["prunePolicy", "schedule"]}
+              defaults={ScheduleDefaultsInfrequent}
+            />
           </Form.Item>
 
           {/* Repo.checkPolicy */}
@@ -501,15 +511,18 @@ export const AddRepoModal = ({ template }: { template: Repo | null }) => {
               initialValue={0}
               required={false}
             >
-              <InputNumber
+              <InputPercent
                 addonBefore={
                   <Tooltip title="The percentage of pack data in this repository that will be read and verified. Higher values will use more bandwidth (e.g. 100% will re-read the entire repository on each check).">
-                    <div style={{ width: "12" }}>Read Pack Data %</div>
+                    <div style={{ width: "12" }}>Read Data %</div>
                   </Tooltip>
                 }
               />
             </Form.Item>
-            <ScheduleFormItem name={["checkPolicy", "schedule"]} />
+            <ScheduleFormItem
+              name={["checkPolicy", "schedule"]}
+              defaults={ScheduleDefaultsInfrequent}
+            />
           </Form.Item>
 
           {/* Repo.commandPrefix */}
@@ -674,10 +687,7 @@ const expectedEnvVars: { [scheme: string]: string[][] } = {
   ],
 };
 
-const envVarSetValidator = (
-  form: FormInstance<FormData>,
-  envVars: string[]
-) => {
+const envVarSetValidator = (form: FormInstance<any>, envVars: string[]) => {
   if (!envVars) {
     return Promise.resolve();
   }
@@ -781,4 +791,18 @@ const formatMissingEnvVars = (partialMatches: string[][]): string => {
       return x[0];
     })
     .join(" or ");
+};
+
+const InputPercent = ({ ...props }) => {
+  return (
+    <InputNumber
+      step={1}
+      min={0}
+      max={100}
+      precision={2}
+      controls={false}
+      suffix="%"
+      {...props}
+    />
+  );
 };

@@ -1,29 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
-import {
-  BackupInfo,
-  BackupInfoCollector,
-  colorForStatus,
-  detailsForOperation,
-  displayTypeToString,
-  getTypeForDisplay,
-} from "../state/oplog";
-import { Col, Empty, Modal, Row, Tooltip, Tree } from "antd";
+import { Col, Empty, Flex, Modal, Row, Splitter, Tooltip, Tree } from "antd";
 import _ from "lodash";
 import { DataNode } from "antd/es/tree";
+import { formatDate, formatTime, localISOTime } from "../lib/formatting";
+import { ExclamationOutlined, QuestionOutlined } from "@ant-design/icons";
 import {
-  formatBytes,
-  formatDate,
-  formatDuration,
-  formatTime,
-  localISOTime,
-  normalizeSnapshotId,
-} from "../lib/formatting";
-import {
-  ExclamationOutlined,
-  QuestionOutlined,
-  SaveOutlined,
-} from "@ant-design/icons";
-import { OperationStatus } from "../../gen/ts/v1/operations_pb";
+  OperationEventType,
+  OperationStatus,
+} from "../../gen/ts/v1/operations_pb";
 import { useAlertApi } from "./Alerts";
 import { OperationList } from "./OperationList";
 import {
@@ -36,9 +20,18 @@ import { isMobile } from "../lib/browserutil";
 import { useShowModal } from "./ModalManager";
 import { backrestService } from "../api";
 import { ConfirmButton } from "./SpinButton";
+import { OplogState, syncStateFromRequest } from "../state/logstate";
+import {
+  FlowDisplayInfo,
+  colorForStatus,
+  displayInfoForFlow,
+  displayTypeToString,
+} from "../state/flowdisplayaggregator";
+import { OperationIcon } from "./OperationIcon";
+import { shouldHideOperation } from "../state/oplog";
 
 type OpTreeNode = DataNode & {
-  backup?: BackupInfo;
+  backup?: FlowDisplayInfo;
 };
 
 export const OperationTree = ({
@@ -49,35 +42,70 @@ export const OperationTree = ({
   isPlanView?: boolean;
 }>) => {
   const alertApi = useAlertApi();
-  const showModal = useShowModal();
-  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const setScreenWidth = useState(window.innerWidth)[1];
+  const [backups, setBackups] = useState<FlowDisplayInfo[]>([]);
   const [treeData, setTreeData] = useState<{
     tree: OpTreeNode[];
     expanded: React.Key[];
   }>({ tree: [], expanded: [] });
-  const [selectedBackupId, setSelectedBackupId] = useState<string | null>(null);
+  const [selectedBackupId, setSelectedBackupId] = useState<bigint | null>(null);
+
+  // track the screen width so we can switch between mobile and desktop layouts.
+  useEffect(() => {
+    const handleResize = () => {
+      setScreenWidth(window.innerWidth);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
 
   // track backups for this operation tree view.
   useEffect(() => {
     setSelectedBackupId(null);
 
-    const backupCollector = new BackupInfoCollector();
-    backupCollector.subscribe(
-      _.debounce(
-        () => {
-          let backups = backupCollector.getAll();
-          backups.sort((a, b) => {
-            return b.startTimeMs - a.startTimeMs;
-          });
-          setBackups(backups);
-          setTreeData(() => buildTree(backups, isPlanView || false));
-        },
-        100,
-        { leading: true, trailing: true }
-      )
+    const logState = new OplogState((op) => !shouldHideOperation(op));
+
+    const backupInfoByFlowID = new Map<bigint, FlowDisplayInfo>();
+
+    const refresh = _.debounce(
+      () => {
+        const flows = Array.from(backupInfoByFlowID.values());
+        setTreeData(buildTree(flows, isPlanView || false));
+        setBackups(flows);
+      },
+      100,
+      { leading: true, trailing: true }
     );
 
-    return backupCollector.collectFromRequest(req, (err) => {
+    logState.subscribe((ids, flowIDs, event) => {
+      if (
+        event === OperationEventType.EVENT_CREATED ||
+        event === OperationEventType.EVENT_UPDATED
+      ) {
+        for (const flowID of flowIDs) {
+          const ops = logState.getByFlowID(flowID);
+          if (!ops || ops[0].op.case === "operationRunHook") {
+            continue;
+          }
+
+          const displayInfo = displayInfoForFlow(ops);
+          if (!displayInfo.hidden) {
+            backupInfoByFlowID.set(flowID, displayInfo);
+          } else {
+            backupInfoByFlowID.delete(flowID);
+          }
+        }
+      } else if (event === OperationEventType.EVENT_DELETED) {
+        for (const flowID of flowIDs) {
+          backupInfoByFlowID.delete(flowID);
+        }
+      }
+      refresh();
+    });
+
+    return syncStateFromRequest(logState, req, (err) => {
       alertApi!.error("API error: " + err.message);
     });
   }, [JSON.stringify(req)]);
@@ -102,21 +130,7 @@ export const OperationTree = ({
           setSelectedBackupId(null);
           return;
         }
-        setSelectedBackupId(backup.id!);
-
-        if (useMobileLayout) {
-          showModal(
-            <Modal
-              visible={true}
-              footer={null}
-              onCancel={() => {
-                showModal(null);
-              }}
-            >
-              <BackupView backup={backup} />
-            </Modal>
-          );
-        }
+        setSelectedBackupId(backup!.flowID);
       }}
       titleRender={(node: OpTreeNode): React.ReactNode => {
         if (node.title !== undefined) {
@@ -124,72 +138,15 @@ export const OperationTree = ({
         }
         if (node.backup !== undefined) {
           const b = node.backup;
-          const details: string[] = [];
 
-          if (b.operations.length === 0) {
-            // this happens when all operations in a backup are deleted; it should be hidden until the deletion propagates to a refresh of the tree layout.
-            return null;
-          }
-
-          if (b.status === OperationStatus.STATUS_PENDING) {
-            details.push("scheduled, waiting");
-          } else if (b.status === OperationStatus.STATUS_SYSTEM_CANCELLED) {
-            details.push("system cancel");
-          } else if (b.status === OperationStatus.STATUS_USER_CANCELLED) {
-            details.push("cancelled");
-          }
-
-          if (b.backupLastStatus) {
-            if (b.backupLastStatus.entry.case === "summary") {
-              const s = b.backupLastStatus.entry.value;
-              details.push(
-                `${formatBytes(
-                  Number(s.totalBytesProcessed)
-                )} in ${formatDuration(
-                  s.totalDuration! * 1000.0 // convert to ms
-                )}`
-              );
-            } else if (b.backupLastStatus.entry.case === "status") {
-              const s = b.backupLastStatus.entry.value;
-              const percent = Number(s.percentDone) * 100;
-              details.push(
-                `${percent.toFixed(1)}% processed ${formatBytes(
-                  Number(s.bytesDone)
-                )} / ${formatBytes(Number(s.totalBytes))}`
-              );
-            }
-          } else if (b.operations.length === 1) {
-            const op = b.operations[0];
-            const opDetails = detailsForOperation(op);
-            if (
-              opDetails.percentage &&
-              opDetails.percentage > 0.1 &&
-              opDetails.percentage < 99.9
-            ) {
-              details.push(opDetails.displayState);
-            }
-            if (op.snapshotId) {
-              details.push(`ID: ${normalizeSnapshotId(op.snapshotId)}`);
-            }
-          }
-          if (b.snapshotInfo) {
-            details.push(`ID: ${normalizeSnapshotId(b.snapshotInfo.id)}`);
-          }
-
-          let detailsElem: React.ReactNode | null = null;
-          if (details.length > 0) {
-            detailsElem = (
-              <span className="backrest operation-details">
-                [{details.join(", ")}]
-              </span>
-            );
-          }
-
-          const type = getTypeForDisplay(b.operations[0]);
           return (
             <>
-              {displayTypeToString(type)} {formatTime(b.displayTime)}{" "}
-              {detailsElem}
+              {displayTypeToString(b.type)} {formatTime(b.displayTime)}{" "}
+              {b.subtitleComponents && b.subtitleComponents.length > 0 && (
+                <span className="backrest operation-details">
+                  [{b.subtitleComponents.join(", ")}]
+                </span>
+              )}
             </>
           );
         }
@@ -201,33 +158,52 @@ export const OperationTree = ({
   );
 
   if (useMobileLayout) {
-    return backupTree;
+    const backup = backups.find((b) => b.flowID === selectedBackupId);
+    return (
+      <>
+        <Modal
+          open={!!backup}
+          footer={null}
+          onCancel={() => {
+            setSelectedBackupId(null);
+          }}
+          width="60vw"
+        >
+          <BackupView backup={backup} />
+        </Modal>
+        {backupTree}
+      </>
+    );
   }
 
   return (
-    <Row>
-      <Col span={12}>{backupTree}</Col>
-      <Col span={12}>
-        <BackupViewContainer>
-          {selectedBackupId ? (
-            <BackupView
-              backup={backups.find((b) => b.id === selectedBackupId)}
-            />
-          ) : null}
-        </BackupViewContainer>
-      </Col>
-    </Row>
+    <Flex vertical gap="middle">
+      <Splitter>
+        <Splitter.Panel defaultSize="40%" min="20%" max="70%">
+          {backupTree}
+        </Splitter.Panel>
+        <Splitter.Panel style={{ paddingLeft: "10px" }}>
+          <BackupViewContainer>
+            {selectedBackupId ? (
+              <BackupView
+                backup={backups.find((b) => b.flowID === selectedBackupId)}
+              />
+            ) : null}
+          </BackupViewContainer>{" "}
+        </Splitter.Panel>
+      </Splitter>
+    </Flex>
   );
 };
 
-const treeLeafCache = new WeakMap<BackupInfo, OpTreeNode>();
+const treeLeafCache = new WeakMap<FlowDisplayInfo, OpTreeNode>();
 const buildTree = (
-  operations: BackupInfo[],
+  operations: FlowDisplayInfo[],
   isForPlanView: boolean
 ): { tree: OpTreeNode[]; expanded: React.Key[] } => {
-  const buildTreeInstanceID = (operations: BackupInfo[]): OpTreeNode[] => {
+  const buildTreeInstanceID = (operations: FlowDisplayInfo[]): OpTreeNode[] => {
     const grouped = _.groupBy(operations, (op) => {
-      return op.operations[0].instanceId!;
+      return op.instanceID;
     });
 
     const entries: OpTreeNode[] = _.map(grouped, (value, key) => {
@@ -250,9 +226,9 @@ const buildTree = (
     return entries;
   };
 
-  const buildTreePlan = (operations: BackupInfo[]): OpTreeNode[] => {
+  const buildTreePlan = (operations: FlowDisplayInfo[]): OpTreeNode[] => {
     const grouped = _.groupBy(operations, (op) => {
-      return op.operations[0].planId!;
+      return op.planID;
     });
     const entries: OpTreeNode[] = _.map(grouped, (value, key) => {
       let title: React.ReactNode = key;
@@ -281,7 +257,7 @@ const buildTree = (
 
   const buildTreeDay = (
     keyPrefix: string,
-    operations: BackupInfo[]
+    operations: FlowDisplayInfo[]
   ): OpTreeNode[] => {
     const grouped = _.groupBy(operations, (op) => {
       return localISOTime(op.displayTime).substring(0, 10);
@@ -298,7 +274,7 @@ const buildTree = (
     return entries;
   };
 
-  const buildTreeLeaf = (operations: BackupInfo[]): OpTreeNode[] => {
+  const buildTreeLeaf = (operations: FlowDisplayInfo[]): OpTreeNode[] => {
     const entries = _.map(operations, (b): OpTreeNode => {
       let cached = treeLeafCache.get(b);
       if (cached) {
@@ -307,14 +283,17 @@ const buildTree = (
       let iconColor = colorForStatus(b.status);
       let icon: React.ReactNode | null = <QuestionOutlined />;
 
-      if (b.status === OperationStatus.STATUS_ERROR) {
+      if (
+        b.status === OperationStatus.STATUS_ERROR ||
+        b.status === OperationStatus.STATUS_WARNING
+      ) {
         icon = <ExclamationOutlined style={{ color: iconColor }} />;
       } else {
-        icon = <SaveOutlined style={{ color: iconColor }} />;
+        icon = <OperationIcon status={b.status} type={b.type} />;
       }
 
       let newLeaf = {
-        key: b.id,
+        key: b.flowID,
         backup: b,
         icon: icon,
       };
@@ -322,7 +301,7 @@ const buildTree = (
       return newLeaf;
     });
     entries.sort((a, b) => {
-      return b.backup!.startTimeMs - a.backup!.startTimeMs;
+      return b.backup!.displayTime - a.backup!.displayTime;
     });
     return entries;
   };
@@ -414,6 +393,9 @@ const BackupViewContainer = ({ children }: { children: React.ReactNode }) => {
 
     // handle scroll events to keep the fixed container in view.
     const handleScroll = () => {
+      if (!ref.current) {
+        return;
+      }
       const refRect = ref.current!.getBoundingClientRect();
       let wiggle = Math.max(refRect.height - window.innerHeight, 0);
       let topY = Math.max(ref.current!.getBoundingClientRect().top, 0);
@@ -471,7 +453,7 @@ const BackupViewContainer = ({ children }: { children: React.ReactNode }) => {
   );
 };
 
-const BackupView = ({ backup }: { backup?: BackupInfo }) => {
+const BackupView = ({ backup }: { backup?: FlowDisplayInfo }) => {
   const alertApi = useAlertApi();
   if (!backup) {
     return <Empty description="Backup not found." />;
@@ -480,9 +462,9 @@ const BackupView = ({ backup }: { backup?: BackupInfo }) => {
       try {
         await backrestService.forget(
           new ForgetRequest({
-            planId: backup.planId!,
-            repoId: backup.repoId!,
-            snapshotId: backup.snapshotId!,
+            planId: backup.planID!,
+            repoId: backup.repoID!,
+            snapshotId: backup.snapshotID!,
           })
         );
         alertApi!.success("Snapshot forgotten.");
@@ -491,34 +473,39 @@ const BackupView = ({ backup }: { backup?: BackupInfo }) => {
       }
     };
 
-    const deleteButton = backup.snapshotId ? (
-      <Tooltip title="This will remove the snapshot from the repository. This is irreversible.">
+    const snapshotInFlow = backup?.operations.find(
+      (op) => op.op.case === "operationIndexSnapshot"
+    );
+
+    const deleteButton =
+      snapshotInFlow && snapshotInFlow.snapshotId ? (
+        <Tooltip title="This will remove the snapshot from the repository. This is irreversible.">
+          <ConfirmButton
+            type="text"
+            confirmTitle="Confirm forget?"
+            confirmTimeout={2000}
+            onClickAsync={doDeleteSnapshot}
+          >
+            Forget (Destructive)
+          </ConfirmButton>
+        </Tooltip>
+      ) : (
         <ConfirmButton
           type="text"
-          confirmTitle="Confirm forget?"
-          confirmTimeout={2000}
-          onClickAsync={doDeleteSnapshot}
+          confirmTitle="Confirm clear?"
+          onClickAsync={async () => {
+            backrestService.clearHistory(
+              new ClearHistoryRequest({
+                selector: new OpSelector({
+                  flowId: backup.flowID,
+                }),
+              })
+            );
+          }}
         >
-          Forget (Destructive)
+          Delete Event
         </ConfirmButton>
-      </Tooltip>
-    ) : (
-      <ConfirmButton
-        type="text"
-        confirmTitle="Confirm clear?"
-        onClickAsync={async () => {
-          backrestService.clearHistory(
-            new ClearHistoryRequest({
-              selector: new OpSelector({
-                ids: backup.operations.map((op) => op.id),
-              }),
-            })
-          );
-        }}
-      >
-        Delete Event
-      </ConfirmButton>
-    );
+      );
 
     return (
       <div style={{ width: "100%" }}>
@@ -531,15 +518,15 @@ const BackupView = ({ backup }: { backup?: BackupInfo }) => {
             height: "60px",
           }}
         >
-          <h3>Backup on {formatTime(backup.displayTime)}</h3>
+          <h3>{formatTime(backup.displayTime)}</h3>
           <div style={{ position: "absolute", right: "20px" }}>
             {backup.status !== OperationStatus.STATUS_PENDING &&
-            backup.status != OperationStatus.STATUS_INPROGRESS
+            backup.status !== OperationStatus.STATUS_INPROGRESS
               ? deleteButton
               : null}
           </div>
         </div>
-        <OperationList key={backup.id} useBackups={[backup]} />
+        <OperationList key={backup.flowID} useOperations={backup.operations} />
       </div>
     );
   }

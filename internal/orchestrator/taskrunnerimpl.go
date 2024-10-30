@@ -13,6 +13,7 @@ import (
 	"github.com/garethgeorge/backrest/internal/orchestrator/logging"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
 	"github.com/garethgeorge/backrest/internal/orchestrator/tasks"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -103,15 +104,20 @@ func (t *taskRunnerImpl) ExecuteHooks(ctx context.Context, events []v1.Hook_Cond
 	}
 
 	for _, task := range hookTasks {
-		st, _ := task.Next(time.Now(), t)
-		st.Task = task
-		if err := t.OpLog().Add(st.Op); err != nil {
-			return fmt.Errorf("%v: %w", task.Name(), err)
+		st, err := t.orchestrator.CreateUnscheduledTask(task, tasks.TaskPriorityDefault, time.Now())
+		if err != nil {
+			return fmt.Errorf("creating task for hook: %w", err)
 		}
 		if err := t.orchestrator.RunTask(ctx, st); hook.IsHaltingError(err) {
 			var cancelErr *hook.HookErrorRequestCancel
+			var retryErr *hook.HookErrorRetry
 			if errors.As(err, &cancelErr) {
-				return fmt.Errorf("%w: %w", tasks.ErrTaskCancelled, err)
+				return fmt.Errorf("%v: %w: %w", task.Name(), &tasks.TaskCancelledError{}, cancelErr.Err)
+			} else if errors.As(err, &retryErr) {
+				return fmt.Errorf("%v: %w", task.Name(), &tasks.TaskRetryError{
+					Err:     retryErr.Err,
+					Backoff: retryErr.Backoff,
+				})
 			}
 			return fmt.Errorf("%v: %w", task.Name(), err)
 		}
@@ -150,9 +156,11 @@ func (t *taskRunnerImpl) Config() *v1.Config {
 }
 
 func (t *taskRunnerImpl) Logger(ctx context.Context) *zap.Logger {
-	return logging.Logger(ctx).Named(t.t.Name())
+	return logging.Logger(ctx, "[tasklog] ").Named(t.t.Name())
 }
 
-func (t *taskRunnerImpl) RawLogWriter(ctx context.Context) io.Writer {
-	return logging.WriterFromContext(ctx)
+func (t *taskRunnerImpl) LogrefWriter() (string, io.WriteCloser, error) {
+	logID := uuid.New().String()
+	writer, err := t.orchestrator.logStore.Create(logID, t.op.GetId(), time.Duration(0))
+	return logID, writer, err
 }

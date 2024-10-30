@@ -2,10 +2,13 @@ package tasks
 
 import (
 	"context"
+	"errors"
 	"io"
+	"testing"
 	"time"
 
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
+	"github.com/garethgeorge/backrest/internal/config"
 	"github.com/garethgeorge/backrest/internal/oplog"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
 	"go.uber.org/zap"
@@ -50,8 +53,8 @@ type TaskRunner interface {
 	Config() *v1.Config
 	// Logger returns the logger.
 	Logger(ctx context.Context) *zap.Logger
-	// RawLogWriter returns a writer for raw logs.
-	RawLogWriter(ctx context.Context) io.Writer
+	// LogrefWriter returns a writer that can be used to track streaming operation output.
+	LogrefWriter() (id string, w io.WriteCloser, err error)
 }
 
 type TaskExecutor interface {
@@ -79,6 +82,7 @@ func (s ScheduledTask) Less(other ScheduledTask) bool {
 // Task is a task that can be scheduled to run at a specific time.
 type Task interface {
 	Name() string                                                       // human readable name for this task.
+	Type() string                                                       // simple string 'type' for this task.
 	Next(now time.Time, runner TaskRunner) (ScheduledTask, error)       // returns the next scheduled task.
 	Run(ctx context.Context, st ScheduledTask, runner TaskRunner) error // run the task.
 	PlanID() string                                                     // the ID of the plan this task is associated with.
@@ -86,9 +90,14 @@ type Task interface {
 }
 
 type BaseTask struct {
+	TaskType   string
 	TaskName   string
 	TaskPlanID string
 	TaskRepoID string
+}
+
+func (b BaseTask) Type() string {
+	return b.TaskType
 }
 
 func (b BaseTask) Name() string {
@@ -148,4 +157,70 @@ func timeToUnixMillis(t time.Time) int64 {
 
 func curTimeMillis() int64 {
 	return timeToUnixMillis(time.Now())
+}
+
+type testTaskRunner struct {
+	config *v1.Config // the config to use for the task runner.
+	oplog  *oplog.OpLog
+}
+
+var _ TaskRunner = &testTaskRunner{}
+
+func newTestTaskRunner(_ testing.TB, config *v1.Config, oplog *oplog.OpLog) *testTaskRunner {
+	return &testTaskRunner{
+		config: config,
+		oplog:  oplog,
+	}
+}
+
+func (t *testTaskRunner) CreateOperation(op *v1.Operation) error {
+	panic("not implemented")
+}
+
+func (t *testTaskRunner) UpdateOperation(op *v1.Operation) error {
+	panic("not implemented")
+}
+
+func (t *testTaskRunner) ExecuteHooks(ctx context.Context, events []v1.Hook_Condition, vars HookVars) error {
+	panic("not implemented")
+}
+
+func (t *testTaskRunner) OpLog() *oplog.OpLog {
+	return t.oplog
+}
+
+func (t *testTaskRunner) GetRepo(repoID string) (*v1.Repo, error) {
+	cfg := config.FindRepo(t.config, repoID)
+	if cfg == nil {
+		return nil, errors.New("repo not found")
+	}
+	return cfg, nil
+}
+
+func (t *testTaskRunner) GetPlan(planID string) (*v1.Plan, error) {
+	cfg := config.FindPlan(t.config, planID)
+	if cfg == nil {
+		return nil, errors.New("plan not found")
+	}
+	return cfg, nil
+}
+
+func (t *testTaskRunner) GetRepoOrchestrator(repoID string) (*repo.RepoOrchestrator, error) {
+	panic("not implemented")
+}
+
+func (t *testTaskRunner) ScheduleTask(task Task, priority int) error {
+	panic("not implemented")
+}
+
+func (t *testTaskRunner) Config() *v1.Config {
+	return t.config
+}
+
+func (t *testTaskRunner) Logger(ctx context.Context) *zap.Logger {
+	return zap.L()
+}
+
+func (t *testTaskRunner) LogrefWriter() (id string, w io.WriteCloser, err error) {
+	panic("not implemented")
 }

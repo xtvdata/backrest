@@ -3,7 +3,9 @@ package repo
 import (
 	"bytes"
 	"context"
+	"io/ioutil"
 	"os"
+	"path"
 	"runtime"
 	"slices"
 	"strings"
@@ -63,15 +65,14 @@ func TestBackup(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if tc.unixOnly && runtime.GOOS == "windows" {
 				t.Skip("skipping on windows")
 			}
 
-			orchestrator, err := NewRepoOrchestrator(configForTest, tc.repo, helpers.ResticBinary(t))
-			if err != nil {
-				t.Fatalf("failed to create repo orchestrator: %v", err)
-			}
+			orchestrator := initRepoHelper(t, configForTest, tc.repo)
 
 			summary, err := orchestrator.Backup(context.Background(), tc.plan, nil)
 			if err != nil {
@@ -86,6 +87,75 @@ func TestBackup(t *testing.T) {
 				t.Fatalf("expected 100 new files, got %d", summary.FilesNew)
 			}
 		})
+	}
+}
+
+func TestRestore(t *testing.T) {
+	t.Parallel()
+
+	testFile := path.Join(t.TempDir(), "test.txt")
+	if err := ioutil.WriteFile(testFile, []byte("lorum ipsum"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	r := &v1.Repo{
+		Id:       "test",
+		Uri:      t.TempDir(),
+		Password: "test",
+		Flags:    []string{"--no-cache"},
+	}
+
+	plan := &v1.Plan{
+		Id:    "test",
+		Repo:  "test",
+		Paths: []string{testFile},
+	}
+
+	orchestrator := initRepoHelper(t, configForTest, r)
+
+	// Create a backup of the single file
+	summary, err := orchestrator.Backup(context.Background(), plan, nil)
+	if err != nil {
+		t.Fatalf("backup error: %v", err)
+	}
+	if summary.SnapshotId == "" {
+		t.Fatal("expected snapshot id")
+	}
+	if summary.FilesNew != 1 {
+		t.Fatalf("expected 1 new file, got %d", summary.FilesNew)
+	}
+
+	// Restore the file
+	restoreDir := t.TempDir()
+	snapshotPath := strings.ReplaceAll(testFile, ":", "") // remove the colon from the windows path e.g. C:\test.txt -> C\test.txt
+	restoreSummary, err := orchestrator.Restore(context.Background(), summary.SnapshotId, snapshotPath, restoreDir, nil)
+	if err != nil {
+		t.Fatalf("restore error: %v", err)
+	}
+	t.Logf("restore summary: %+v", restoreSummary)
+
+	if runtime.GOOS == "windows" {
+		return
+	}
+
+	if restoreSummary.FilesRestored != 1 {
+		t.Errorf("expected 1 new file, got %d", restoreSummary.FilesRestored)
+	}
+	if restoreSummary.TotalFiles != 1 {
+		t.Errorf("expected 1 total file, got %d", restoreSummary.TotalFiles)
+	}
+
+	// Check the restored file
+	restoredFile := path.Join(restoreDir, "test.txt")
+	if _, err := os.Stat(restoredFile); err != nil {
+		t.Fatalf("failed to stat restored file: %v", err)
+	}
+	restoredData, err := os.ReadFile(restoredFile)
+	if err != nil {
+		t.Fatalf("failed to read restored file: %v", err)
+	}
+	if string(restoredData) != "lorum ipsum" {
+		t.Fatalf("expected 'test', got '%s'", restoredData)
 	}
 }
 
@@ -116,10 +186,7 @@ func TestSnapshotParenting(t *testing.T) {
 		},
 	}
 
-	orchestrator, err := NewRepoOrchestrator(configForTest, r, helpers.ResticBinary(t))
-	if err != nil {
-		t.Fatalf("failed to create repo orchestrator: %v", err)
-	}
+	orchestrator := initRepoHelper(t, configForTest, r)
 
 	for i := 0; i < 4; i++ {
 		for _, plan := range plans {
@@ -178,10 +245,7 @@ func TestSnapshotParenting(t *testing.T) {
 }
 
 func TestEnvVarPropagation(t *testing.T) {
-	t.Parallel()
-
 	repo := t.TempDir()
-	testData := test.CreateTestData(t)
 
 	// create a new repo with cache disabled for testing
 	r := &v1.Repo{
@@ -191,36 +255,27 @@ func TestEnvVarPropagation(t *testing.T) {
 		Env:   []string{"RESTIC_PASSWORD=${MY_FOO}"},
 	}
 
-	plan := &v1.Plan{
-		Id:    "test",
-		Repo:  "test",
-		Paths: []string{testData},
-	}
-
 	orchestrator, err := NewRepoOrchestrator(configForTest, r, helpers.ResticBinary(t))
 	if err != nil {
 		t.Fatalf("failed to create repo orchestrator: %v", err)
 	}
 
-	_, err = orchestrator.Backup(context.Background(), plan, nil)
+	err = orchestrator.Init(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("expected error about RESTIC_PASSWORD, got: %v", err)
 	}
 
 	// set the env var
 	os.Setenv("MY_FOO", "bar")
+	defer os.Unsetenv("MY_FOO")
 	orchestrator, err = NewRepoOrchestrator(configForTest, r, helpers.ResticBinary(t))
 	if err != nil {
 		t.Fatalf("failed to create repo orchestrator: %v", err)
 	}
 
-	summary, err := orchestrator.Backup(context.Background(), plan, nil)
+	err = orchestrator.Init(context.Background())
 	if err != nil {
 		t.Fatalf("backup error: %v", err)
-	}
-
-	if summary.SnapshotId == "" {
-		t.Fatal("expected snapshot id")
 	}
 }
 
@@ -258,15 +313,13 @@ func TestCheck(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			orchestrator, err := NewRepoOrchestrator(configForTest, tc.repo, helpers.ResticBinary(t))
-			if err != nil {
-				t.Fatalf("failed to create repo orchestrator: %v", err)
-			}
-
+			t.Parallel()
+			orchestrator := initRepoHelper(t, configForTest, tc.repo)
 			buf := bytes.NewBuffer(nil)
 
-			err = orchestrator.Init(context.Background())
+			err := orchestrator.Init(context.Background())
 			if err != nil {
 				t.Fatalf("init error: %v", err)
 			}
@@ -278,4 +331,18 @@ func TestCheck(t *testing.T) {
 			t.Logf("check output: %s", buf.String())
 		})
 	}
+}
+
+func initRepoHelper(t *testing.T, config *v1.Config, repo *v1.Repo) *RepoOrchestrator {
+	orchestrator, err := NewRepoOrchestrator(config, repo, helpers.ResticBinary(t))
+	if err != nil {
+		t.Fatalf("failed to create repo orchestrator: %v", err)
+	}
+
+	err = orchestrator.Init(context.Background())
+	if err != nil {
+		t.Fatalf("init error: %v", err)
+	}
+
+	return orchestrator
 }
